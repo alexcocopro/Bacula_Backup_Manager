@@ -21,7 +21,7 @@ shopt -s inherit_errexit 2>/dev/null || true
 unset VERSION 2>/dev/null || true
 
 # Declarar variables readonly con protección
-declare -r VERSION="2.1.1"
+declare -r SCRIPT_VERSION="2.1.1"
 declare -r AUTHOR="Alex Cabello Leiva"
 declare -r TITLE="Consultor en Innovación y Ciberseguridad"
 declare -r SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -2281,12 +2281,12 @@ This is a test email from Bacula Backup Manager.
 Server Information:
 - Hostname: $hostname
 - Date: $date_time
-- Version: $VERSION
+- Version: $SCRIPT_VERSION
 
 If you receive this email, notifications are working correctly.
 
 ---
-Bacula Backup Manager v$VERSION
+Bacula Backup Manager v$SCRIPT_VERSION
 Developed by: $AUTHOR
 "
     
@@ -2397,7 +2397,7 @@ Next Steps:
 - For failed backups: Please investigate immediately
 
 ---
-Bacula Backup Manager v$VERSION
+Bacula Backup Manager v$SCRIPT_VERSION
 Developed by: $AUTHOR
 Email: $EMAIL_FROM
 "
@@ -2462,7 +2462,7 @@ Storage Statistics:
 - Next scheduled cleanup: Tomorrow 02:00 AM
 
 ---
-Bacula Backup Manager v$VERSION
+Bacula Backup Manager v$SCRIPT_VERSION
 Developed by: $AUTHOR
 Email: $EMAIL_FROM
 "
@@ -3083,7 +3083,7 @@ BACKUP_PATH=$backup_path
 SCHEDULE_TYPE=$schedule_type
 RETENTION=$retention
 CONFIG_DATE=$(date -Iseconds)
-SCRIPT_VERSION=$VERSION
+SCRIPT_VERSION=$SCRIPT_VERSION
 EOF
     
     log_message "INFO" "Bacula configuration files generated"
