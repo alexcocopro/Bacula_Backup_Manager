@@ -3078,7 +3078,7 @@ BACKUP_PATH=$backup_path
 SCHEDULE_TYPE=$schedule_type
 RETENTION=$retention
 CONFIG_DATE=$(date -Iseconds)
-VERSION=$VERSION
+SCRIPT_VERSION=$VERSION
 EOF
     
     log_message "INFO" "Bacula configuration files generated"
