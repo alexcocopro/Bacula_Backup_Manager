@@ -3140,7 +3140,7 @@ run_backup() {
                 echo "   $job_count) $job_name"
             fi
         fi
-    done < <(test -f /etc/bacula/bacula-dir.conf && grep -E "^Job \\{\" -A 5 /etc/bacula/bacula-dir.conf 2>/dev/null | grep "Name = " || echo "")
+    done < <(test -f /etc/bacula/bacula-dir.conf && grep -E '^Job \{' /etc/bacula/bacula-dir.conf 2>/dev/null -A 5 | grep "Name = " || echo "")
     
     # Si no hay jobs configurados, usar el legacy
     if [[ $job_count -eq 0 ]]; then
