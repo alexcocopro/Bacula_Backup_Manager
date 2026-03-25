@@ -1341,7 +1341,7 @@ install_bacula() {
                 (
                     export DEBIAN_FRONTEND=noninteractive
                     apt-get update -qq
-                    apt-get install -y -qq bacula-director bacula-storage bacula-fd bacula-console
+                    apt-get install -y -qq bacula-director bacula-sd bacula-fd bacula-console
                 ) &
                 spinner $!
                 wait $! || error_exit "$(t "install_error")"
@@ -1372,7 +1372,7 @@ install_bacula() {
                 (
                     export DEBIAN_FRONTEND=noninteractive
                     apt-get update -qq
-                    apt-get install -y -qq bacula-director bacula-storage bacula-fd bacula-console "$pg_package"
+                    apt-get install -y -qq bacula-director bacula-sd bacula-fd bacula-console "$pg_package"
                 ) &
                 spinner $!
                 wait $! || error_exit "$(t "install_error")"
@@ -1389,14 +1389,14 @@ install_bacula() {
                 
                 # Usar PostgreSQL existente
                 (
-                    dnf install -y -q bacula-director bacula-storage bacula-client bacula-console
+                    dnf install -y -q bacula-director bacula-sd bacula-client bacula-console
                 ) &
                 spinner $!
                 wait $! || error_exit "$(t "install_error")"
             else
                 # Instalar PostgreSQL del repositorio del sistema
                 (
-                    dnf install -y -q bacula-director bacula-storage bacula-client bacula-console postgresql-server
+                    dnf install -y -q bacula-director bacula-sd bacula-client bacula-console postgresql-server
                     postgresql-setup --initdb || true
                     systemctl enable --now postgresql
                 ) &
