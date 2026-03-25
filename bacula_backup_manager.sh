@@ -40,6 +40,7 @@ declare -r COLOR_GREEN='\033[0;32m'
 declare -r COLOR_YELLOW='\033[1;33m'
 declare -r COLOR_BLUE='\033[0;34m'
 declare -r COLOR_CYAN='\033[0;36m'
+declare -r COLOR_INFO='\033[0;36m'
 declare -r COLOR_BOLD='\033[1m'
 declare -r COLOR_DIM='\033[2m'
 
