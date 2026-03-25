@@ -1540,8 +1540,8 @@ create_backup_job() {
         [[ -z "$job_name" ]] && job_name="BackupJob$(date +%H%M%S)"
     fi
     
-    # Validar que el nombre no exista
-    if grep -q "Name = \"$job_name\"" /etc/bacula/bacula-dir.conf 2>/dev/null; then
+    # Validar que el nombre no exista (verificar archivo primero)
+    if [[ -f /etc/bacula/bacula-dir.conf ]] && grep -q "Name = \"$job_name\"" /etc/bacula/bacula-dir.conf 2>/dev/null; then
         echo -e "${COLOR_RED}✗ Job '$job_name' already exists!${COLOR_RESET}"
         return 1
     fi
@@ -1721,9 +1721,11 @@ add_job_to_bacula_config() {
         4) schedule_cron="daily at 02:00" ;;
     esac
     
-    # Obtener password existente
-    local bacula_password
-    bacula_password=$(grep "Password = " /etc/bacula/bacula-dir.conf | head -1 | cut -d'"' -f2)
+    # Obtener password existente (solo si archivo existe)
+    local bacula_password=""
+    if [[ -f /etc/bacula/bacula-dir.conf ]]; then
+        bacula_password=$(grep "Password = " /etc/bacula/bacula-dir.conf 2>/dev/null | head -1 | cut -d'"' -f2)
+    fi
     
     # Crear FileSet específico para este job
     local fileset_name="FS_${job_name}"
@@ -2460,7 +2462,7 @@ Important Notes:
 - No active backups were affected
 
 Storage Statistics:
-- Total volumes before cleanup: $(grep -c "Volume=" /etc/bacula/bacula-dir.conf 2>/dev/null || echo "N/A")
+- Total volumes before cleanup: $(test -f /etc/bacula/bacula-dir.conf && grep -c "Volume=" /etc/bacula/bacula-dir.conf 2>/dev/null || echo "N/A")
 - Cleanup completed at: $date_time
 - Next scheduled cleanup: Tomorrow 02:00 AM
 
@@ -3138,7 +3140,7 @@ run_backup() {
                 echo "   $job_count) $job_name"
             fi
         fi
-    done < <(grep -E "^Job \{" -A 5 /etc/bacula/bacula-dir.conf | grep "Name = ")
+    done < <(test -f /etc/bacula/bacula-dir.conf && grep -E "^Job \\{\" -A 5 /etc/bacula/bacula-dir.conf 2>/dev/null | grep "Name = " || echo "")
     
     # Si no hay jobs configurados, usar el legacy
     if [[ $job_count -eq 0 ]]; then
@@ -3782,7 +3784,7 @@ show_existing_config_info() {
         
         if [[ -f /etc/bacula/bacula-dir.conf ]]; then
             local director_name
-            director_name=$(grep -E "^Director {" /etc/bacula/bacula-dir.conf -A 5 | grep "Name" | head -1 | cut -d'=' -f2 | tr -d ' ;')
+            director_name=$(grep -E "^Director {" /etc/bacula/bacula-dir.conf -A 5 2>/dev/null | grep "Name" | head -1 | cut -d'=' -f2 | tr -d ' ;')
             [[ -n "$director_name" ]] && echo -e "   ${COLOR_CYAN}• Director: $director_name${COLOR_RESET}"
         fi
         
