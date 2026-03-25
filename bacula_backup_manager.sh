@@ -10,33 +10,38 @@
 # Soporte amplio: Debian 9+, Ubuntu 18.04+, RHEL 7+, PostgreSQL 9+
 # =============================================================================
 
+# Configuración de shell para máxima compatibilidad
 set -euo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
 # =============================================================================
 # CONFIGURACIÓN GLOBAL / GLOBAL CONFIGURATION
 # =============================================================================
-readonly VERSION="2.1.1"
-readonly AUTHOR="Alex Cabello Leiva"
-readonly TITLE="Consultor en Innovación y Ciberseguridad"
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
-readonly LOG_DIR="/var/log/bacula-manager"
-readonly CONFIG_DIR="/etc/bacula-manager"
-readonly LOCK_FILE="/var/run/bacula-manager.lock"
-readonly SSH_DIR="/root/.ssh"
-readonly ENV_FILE="/etc/bacula-manager/environment"
-readonly REMOTE_CONFIG_DIR="/etc/bacula-manager/remote"
+# Limpiar variables de entorno conflictivas
+unset VERSION 2>/dev/null || true
+
+# Declarar variables readonly con protección
+declare -r VERSION="2.1.1"
+declare -r AUTHOR="Alex Cabello Leiva"
+declare -r TITLE="Consultor en Innovación y Ciberseguridad"
+declare -r SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+declare -r SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+declare -r LOG_DIR="/var/log/bacula-manager"
+declare -r CONFIG_DIR="/etc/bacula-manager"
+declare -r LOCK_FILE="/var/run/bacula-manager.lock"
+declare -r SSH_DIR="/root/.ssh"
+declare -r ENV_FILE="/etc/bacula-manager/environment"
+declare -r REMOTE_CONFIG_DIR="/etc/bacula-manager/remote"
 
 # Colores / Colors
-readonly COLOR_RESET='\033[0m'
-readonly COLOR_RED='\033[0;31m'
-readonly COLOR_GREEN='\033[0;32m'
-readonly COLOR_YELLOW='\033[1;33m'
-readonly COLOR_BLUE='\033[0;34m'
-readonly COLOR_CYAN='\033[0;36m'
-readonly COLOR_BOLD='\033[1m'
-readonly COLOR_DIM='\033[2m'
+declare -r COLOR_RESET='\033[0m'
+declare -r COLOR_RED='\033[0;31m'
+declare -r COLOR_GREEN='\033[0;32m'
+declare -r COLOR_YELLOW='\033[1;33m'
+declare -r COLOR_BLUE='\033[0;34m'
+declare -r COLOR_CYAN='\033[0;36m'
+declare -r COLOR_BOLD='\033[1m'
+declare -r COLOR_DIM='\033[2m'
 
 # Variables de idioma / Language variables
 LANG="${LANG:-es}"
