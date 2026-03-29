@@ -465,6 +465,12 @@ t() {
         "menu_exit")
             [[ "$LANG" == "en" ]] && echo "Exit" || echo "Salir"
             ;;
+        "menu_email_status")
+            [[ "$LANG" == "en" ]] && echo "Email Notifications Status" || echo "Estado de Notificaciones por Email"
+            ;;
+        "menu_port_management")
+            [[ "$LANG" == "en" ]] && echo "Port Management Status" || echo "Estado de Gestión de Puertos"
+            ;;
         "menu_remote")
             [[ "$LANG" == "en" ]] && echo "Remote Backup Configuration" || echo "Configuración de Respaldo Remoto"
             ;;
@@ -943,6 +949,30 @@ t() {
         "installing_postgresql_version")
             [[ "$LANG" == "en" ]] && echo "Installing PostgreSQL package:" || echo "Instalando paquete PostgreSQL:"
             ;;
+        "ask_time")
+            [[ "$LANG" == "en" ]] && echo "Enter backup time (HH:MM):" || echo "Ingrese la hora del respaldo (HH:MM):"
+            ;;
+        "ask_strategy")
+            [[ "$LANG" == "en" ]] && echo "Backup strategy:" || echo "Estrategia de respaldo:"
+            ;;
+        "strategy_inc")
+            [[ "$LANG" == "en" ]] && echo "Incremental daily (Fastest)" || echo "Incremental diario (Más rápido)"
+            ;;
+        "strategy_full")
+            [[ "$LANG" == "en" ]] && echo "Full daily (Safest, slow)" || echo "Completo diario (Más seguro, lento)"
+            ;;
+        "strategy_mixed")
+            [[ "$LANG" == "en" ]] && echo "Mixed: Full on Sundays, Incremental daily" || echo "Mixto: Completo los domingos, Incremental diario (Recomendado)"
+            ;;
+        "ask_storage")
+            [[ "$LANG" == "en" ]] && echo "Storage destination:" || echo "Destino de almacenamiento:"
+            ;;
+        "storage_local")
+            [[ "$LANG" == "en" ]] && echo "Local storage" || echo "Almacenamiento local"
+            ;;
+        "storage_remote")
+            [[ "$LANG" == "en" ]] && echo "Remote storage (if configured)" || echo "Almacenamiento remoto (si está configurado)"
+            ;;
         # Reset / Resetear
         "reset_warning")
             [[ "$LANG" == "en" ]] && echo "WARNING: This will delete configuration data!" || echo "ADVERTENCIA: ¡Esto eliminará datos de configuración!"
@@ -1416,12 +1446,13 @@ install_bacula() {
     case "$distro" in
         debian|ubuntu)
             # Detectar versión de Debian/Ubuntu para compatibilidad
-            local os_version=""
-            if [[ -f /etc/debian_version ]]; then
-                os_version=$(cat /etc/debian_version | cut -d. -f1)
-            elif [[ -f /etc/lsb-release ]]; then
-                . /etc/lsb-release
-                os_version=$(echo "$DISTRIB_RELEASE" | cut -d. -f1)
+            local os_version="0"
+            if [[ -f /etc/os-release ]]; then
+                os_version=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"' | cut -d. -f1 | tr -d '
+')
+            fi
+            if ! [[ "$os_version" =~ ^[0-9]+$ ]] || [[ -z "$os_version" ]] || [[ "$os_version" == "0" ]]; then
+                if [[ "$distro" == "debian" ]]; then os_version=11; else os_version=20; fi
             fi
             
             # Verificar versión existente y decidir estrategia
@@ -1626,9 +1657,9 @@ EOF
     chmod 600 "$CONFIG_DIR/db_credentials.conf"
     
     # Actualizar configuración Bacula / Update Bacula config
-    sed -i "s/dbname = ".*"/dbname = \"bacula\"/g" /etc/bacula/bacula-dir.conf 2>/dev/null || true
-    sed -i "s/dbuser = ".*"/dbuser = \"bacula\"/g" /etc/bacula/bacula-dir.conf 2>/dev/null || true
-    sed -i "s/dbpassword = ".*"/dbpassword = \"$db_password\"/g" /etc/bacula/bacula-dir.conf 2>/dev/null || true
+    sed -i 's/dbname = .*/dbname = "bacula"/g' /etc/bacula/bacula-dir.conf 2>/dev/null || true
+    sed -i 's/dbuser = .*/dbuser = "bacula"/g' /etc/bacula/bacula-dir.conf 2>/dev/null || true
+    sed -i "s/dbpassword = .*/dbpassword = \"$db_password\"/g" /etc/bacula/bacula-dir.conf 2>/dev/null || true
     
     echo -e "   ${COLOR_GREEN}✓ $(t "bacula_db_configured")${COLOR_RESET}"
 }
@@ -1734,21 +1765,41 @@ create_backup_job() {
         esac
     done
     
-    # Horario
-    if [[ -z "$schedule_type" ]]; then
-        echo -e "${COLOR_BOLD}Schedule / Horario:${COLOR_RESET}"
-        echo "   1) $(t "option_daily") - 02:00 AM"
-        echo "   2) $(t "option_weekly") - Sundays 02:00 AM"
-        echo "   3) $(t "option_monthly") - 1st day 02:00 AM"
-        echo "   4) $(t "option_custom_schedule")"
-        
-        while true; do
-            read -rp "   $(t "select_option") [1-4]: " schedule_type
-            case $schedule_type in
-                1|2|3|4) break ;;
-                *) echo -e "   ${COLOR_RED}$(t "invalid_option")${COLOR_RESET}" ;;
-            esac
-        done
+    # Horario y Estrategia
+    local backup_time="02:00"
+    local strategy_type="3"
+    
+    echo -e "${COLOR_BOLD}$(t "ask_time")${COLOR_RESET}"
+    read -rp "   [00:00 - 23:59] [$backup_time]: " input_time
+    [[ -n "$input_time" ]] && backup_time="$input_time"
+    
+    # Validar formato HH:MM
+    if ! [[ "$backup_time" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+        echo -e "   ${COLOR_YELLOW}⚠ Invalid format, using 02:00${COLOR_RESET}"
+        backup_time="02:00"
+    fi
+
+    echo -e "${COLOR_BOLD}$(t "ask_strategy")${COLOR_RESET}"
+    echo "   1) $(t "strategy_inc")"
+    echo "   2) $(t "strategy_full")"
+    echo "   3) $(t "strategy_mixed")"
+    
+    while true; do
+        read -rp "   $(t "select_option") [1-3]: " strategy_type
+        case "$strategy_type" in
+            1|2|3) break ;;
+            *) echo -e "   ${COLOR_RED}$(t "invalid_option")${COLOR_RESET}" ;;
+        esac
+    done
+
+    # Destino de almacenamiento
+    local storage_target="local"
+    if [[ -f "$REMOTE_CONFIG_DIR/active.conf" ]]; then
+        echo -e "${COLOR_BOLD}$(t "ask_storage")${COLOR_RESET}"
+        echo "   1) $(t "storage_local")"
+        echo "   2) $(t "storage_remote")"
+        read -rp "   $(t "select_option") [1-2]: " storage_choice
+        [[ "$storage_choice" == "2" ]] && storage_target="remote"
     fi
     
     # Retención
@@ -1769,16 +1820,17 @@ create_backup_job() {
     fi
     
     # Guardar configuración del job
-    save_job_config "$job_name" "$job_description" "$backup_path" "$schedule_type" "$retention" "${job_include_paths[@]}" "${job_exclude_paths[@]}"
+    save_job_config "$job_name" "$job_description" "$backup_path" "$schedule_type" "$retention" "$backup_time" "$strategy_type" "$storage_target" "${job_include_paths[@]}"
     
     # Agregar job a la configuración de Bacula
-    add_job_to_bacula_config "$job_name" "$job_description" "$backup_path" "$schedule_type" "$retention" "${job_include_paths[@]}" "${job_exclude_paths[@]}"
+    add_job_to_bacula_config "$job_name" "$job_description" "$backup_path" "$schedule_type" "$retention" "$backup_time" "$strategy_type" "$storage_target" "${job_include_paths[@]}"
     
     echo -e "${COLOR_GREEN}✓ Backup job '$job_name' created successfully!${COLOR_RESET}"
     echo -e "   ${COLOR_CYAN}Description: $job_description${COLOR_RESET}"
-    echo -e "   ${COLOR_CYAN}Path: $backup_path${COLOR_RESET}"
-    echo -e "   ${COLOR_CYAN}Schedule: $(get_schedule_description $schedule_type)${COLOR_RESET}"
-    echo -e "   ${COLOR_CYAN}Retention: $(get_retention_description $retention)${COLOR_RESET}"
+    echo -e "   ${COLOR_CYAN}Time: $backup_time${COLOR_RESET}"
+    echo -e "   ${COLOR_CYAN}Strategy: $strategy_type${COLOR_RESET}"
+    echo -e "   ${COLOR_CYAN}Storage: $storage_target${COLOR_RESET}"
+    echo -e "   ${COLOR_CYAN}Retention: $(get_retention_description "$retention")${COLOR_RESET}"
     
     log_message "INFO" "Backup job created: $job_name"
     
@@ -1792,21 +1844,29 @@ save_job_config() {
     local backup_path="${3:-}"
     local schedule_type="${4:-}"
     local retention="${5:-}"
-    shift 5
+    local backup_time="${6:-02:00}"
+    local strategy_type="${7:-3}"
+    local storage_target="${8:-local}"
+    shift 8
     local include_paths=("$@")
     
     # Crear directorio de configuración de jobs si no existe
     mkdir -p "$CONFIG_DIR/jobs"
     
-    # Guardar configuración del job
-    cat > "$CONFIG_DIR/jobs/${job_name}.conf" << EOF
-JOB_NAME="$job_name"
-JOB_DESCRIPTION="$job_description"
-BACKUP_PATH="$backup_path"
-SCHEDULE_TYPE="$schedule_type"
-RETENTION="$retention"
-INCLUDE_PATHS=(${include_paths[*]})
-EOF
+    # Guardar configuración del job de forma segura
+    {
+        echo "JOB_NAME=\"$job_name\""
+        echo "JOB_DESCRIPTION=\"$job_description\""
+        echo "BACKUP_PATH=\"$backup_path\""
+        echo "SCHEDULE_TYPE=\"$schedule_type\""
+        echo "RETENTION=\"$retention\""
+        echo "BACKUP_TIME=\"$backup_time\""
+        echo "STRATEGY_TYPE=\"$strategy_type\""
+        echo "STORAGE_TARGET=\"$storage_target\""
+        echo -n "INCLUDE_PATHS=("
+        for p in "${include_paths[@]}"; do echo -n "\"$p\" "; done
+        echo ")"
+    } > "$CONFIG_DIR/jobs/${job_name}.conf"
     
     chmod 600 "$CONFIG_DIR/jobs/${job_name}.conf"
 }
@@ -1818,33 +1878,49 @@ add_job_to_bacula_config() {
     local backup_path="${3:-}"
     local schedule_type="${4:-}"
     local retention="${5:-}"
-    shift 5
+    local backup_time="${6:-02:00}"
+    local strategy_type="${7:-3}"
+    local storage_target="${8:-local}"
+    shift 8
     local include_paths=("$@")
     
     # Calcular valores de retención
     local vol_retention job_retention file_retention
-    case $retention in
+    case "$retention" in
         1) vol_retention="30 days"; job_retention="30 days"; file_retention="30 days" ;;
         2) vol_retention="90 days"; job_retention="90 days"; file_retention="90 days" ;;
         3) vol_retention="1 year"; job_retention="1 year"; file_retention="1 year" ;;
         4) vol_retention="3 years"; job_retention="3 years"; file_retention="3 years" ;;
     esac
     
-    # Calcular horario
-    local schedule_cron
-    case $schedule_type in
-        1) schedule_cron="daily at 02:00" ;;
-        2) schedule_cron="sun at 02:00" ;;
-        3) schedule_cron="1 at 02:00" ;;
-        4) schedule_cron="daily at 02:00" ;;
+    # Extraer hora y minuto
+    local hour=$(echo "$backup_time" | cut -d: -f1)
+    local min=$(echo "$backup_time" | cut -d: -f2)
+
+    # Definir Schedule basado en la estrategia y hora
+    local schedule_lines=""
+    case "$strategy_type" in
+        1) # Incremental diario
+            schedule_lines="Run = Level=Incremental daily at ${hour}:${min}"
+            ;;
+        2) # Completo diario
+            schedule_lines="Run = Level=Full daily at ${hour}:${min}"
+            ;;
+        3) # Mixto: Completo el domingo, Incremental resto de días
+            schedule_lines="Run = Level=Full sun at ${hour}:${min}
+    Run = Level=Incremental mon-sat at ${hour}:${min}"
+            ;;
     esac
     
-    # Obtener password existente (solo si archivo existe)
-    local bacula_password=""
-    if [[ -f /etc/bacula/bacula-dir.conf ]]; then
-        bacula_password=$(grep "Password = " /etc/bacula/bacula-dir.conf 2>/dev/null | head -1 | cut -d'"' -f2)
+    # Determinar almacenamiento
+    local storage_name="File1"
+    if [[ "$storage_target" == "remote" ]]; then
+        # Intentar detectar el nombre del almacenamiento remoto configurado
+        if grep -q "Name = RemoteStorage" /etc/bacula/bacula-sd-remote.conf 2>/dev/null; then
+            storage_name=$(grep "Name =" /etc/bacula/bacula-sd-remote.conf | head -1 | cut -d= -f2 | tr -d ' "')
+        fi
     fi
-    
+
     # Crear FileSet específico para este job
     local fileset_name="FS_${job_name}"
     
@@ -1862,7 +1938,7 @@ EOF
     
     # Agregar paths de inclusión
     for path in "${include_paths[@]}"; do
-        echo "        File = $path" >> /etc/bacula/bacula-dir.conf
+        echo "        File = \"$path\"" >> /etc/bacula/bacula-dir.conf
     done
     
     cat >> /etc/bacula/bacula-dir.conf << EOF
@@ -1885,7 +1961,7 @@ EOF
 # Schedule for job: $job_name
 Schedule {
     Name = "Schedule_${job_name}"
-    Run = $schedule_cron
+    $schedule_lines
 }
 
 # Job: $job_name
@@ -1896,13 +1972,26 @@ Job {
     Client = $(hostname -s)-fd
     FileSet = "$fileset_name"
     Schedule = "Schedule_${job_name}"
-    Storage = File1
+    Storage = $storage_name
     Messages = Standard
     Pool = File
     SpoolAttributes = yes
     Priority = 10
     Write Bootstrap = "/var/lib/bacula/${job_name}.bsr"
     Enabled = yes
+    
+    # Manejo automático de puertos por seguridad / Automatic port management for security
+    RunScript {
+        RunsWhen = Before
+        FailJobOnError = No
+        Command = "/usr/local/bin/baculamanager --open-ports"
+    }
+    RunScript {
+        RunsWhen = After
+        RunsOnFailure = Yes
+        RunsOnSuccess = Yes
+        Command = "/usr/local/bin/baculamanager --close-ports"
+    }
 }
 
 # Restore job for: $job_name
@@ -1910,7 +1999,7 @@ Job {
     Name = "Restore_${job_name}"
     Type = Restore
     Client = $(hostname -s)-fd
-    Storage = File1
+    Storage = $storage_name
     FileSet = "$fileset_name"
     Pool = File
     Messages = Standard
@@ -1974,10 +2063,13 @@ delete_backup_job() {
     echo -e "${COLOR_YELLOW}WARNING: This will permanently delete the job and its configuration!${COLOR_RESET}"
     echo ""
     
-    read -rp "Enter job name to delete / Ingrese nombre del job a eliminar: " job_name
+    read -rp "Enter job name to delete / Ingrese nombre del job a eliminar: " input_name
+    
+    # Sanitizar el nombre para evitar inyecciones en sed
+    local job_name=$(echo "$input_name" | tr -dc 'a-zA-Z0-9_-')
     
     if [[ -z "$job_name" ]]; then
-        echo -e "${COLOR_RED}No job name provided.${COLOR_RESET}"
+        echo -e "${COLOR_RED}Invalid or empty job name provided.${COLOR_RESET}"
         return
     fi
     
@@ -2933,6 +3025,7 @@ get_retention_description() {
 # --- Configurar respaldo de bases de datos / Configure database backup ---
 configure_database_backup() {
     echo -e "   ${COLOR_CYAN}$(t "info"): Database backup configuration${COLOR_RESET}"
+    echo -e "   ${COLOR_YELLOW}⚠ WARNING: Configure pg_dump or mysqldump in a pre-backup script for consistent hot backups.${COLOR_RESET}"
     
     # Detectar bases de datos instaladas / Detect installed databases
     local has_postgres=false
@@ -2962,6 +3055,19 @@ generate_bacula_config() {
     local retention="${5:-}"
     shift 5
     local include_paths=("$@")
+    
+    # Cargar configuración de email si existe
+    local email_config="$CONFIG_DIR/email.conf"
+    local smtp_server="localhost"
+    local email_to="root@localhost"
+    local email_from="bacula@$(hostname -f)"
+    
+    if [[ -f "$email_config" ]]; then
+        source "$email_config" 2>/dev/null
+        smtp_server="${SMTP_SERVER:-localhost}"
+        email_to="${EMAIL_TO:-root@localhost}"
+        email_from="${EMAIL_FROM:-bacula@$(hostname -f)}"
+    fi
     
     # Calcular valores de retención / Calculate retention values
     local vol_retention
@@ -3112,10 +3218,10 @@ Pool {
 
 Messages {
     Name = Standard
-    mailcommand = "/usr/bin/bsmtp -h localhost -f \"Bacula <bacula@localhost>\" -s \"Bacula Report %t %e %c %l\" %r"
-    operatorcommand = "/usr/bin/bsmtp -h localhost -f \"Bacula <bacula@localhost>\" -s \"Bacula Intervention Required %r\" %r"
-    mail = root@localhost = all, !skipped
-    operator = root@localhost = mount
+    mailcommand = "/usr/bin/bsmtp -h $smtp_server -f \"$email_from\" -s \"Bacula Report %t %e %c %l\" %r"
+    operatorcommand = "/usr/bin/bsmtp -h $smtp_server -f \"$email_from\" -s \"Bacula Intervention Required %r\" %r"
+    mail = $email_to = all, !skipped
+    operator = $email_to = mount
     console = all, !skipped, !saved
     append = "/var/log/bacula/bacula.log" = all, !skipped
     catalog = all
@@ -3123,8 +3229,8 @@ Messages {
 
 Messages {
     Name = Daemon
-    mailcommand = "/usr/bin/bsmtp -h localhost -f \"Bacula <bacula@localhost>\" -s \"Bacula Daemon Message %t %e %c %l\" %r"
-    mail = root@localhost = all, !skipped
+    mailcommand = "/usr/bin/bsmtp -h $smtp_server -f \"$email_from\" -s \"Bacula Daemon Message %t %e %c %l\" %r"
+    mail = $email_to = all, !skipped
     console = all, !skipped, !saved
     append = "/var/log/bacula/bacula.log" = all, !skipped
 }
@@ -3321,7 +3427,7 @@ run_backup() {
                 echo "   $job_count) $job_name"
             fi
         fi
-    done < <(test -f /etc/bacula/bacula-dir.conf && grep -E '^Job \{' /etc/bacula/bacula-dir.conf 2>/dev/null -A 5 | grep "Name = " || echo "")
+    done < <(test -f /etc/bacula/bacula-dir.conf && grep -iE '^Job[[:space:]]*\{' /etc/bacula/bacula-dir.conf 2>/dev/null -A 5 | grep "Name = " || echo "")
     
     # Si no hay jobs configurados, usar el legacy
     if [[ $job_count -eq 0 ]]; then
@@ -3598,7 +3704,7 @@ restore_backup() {
     local restore_result
     restore_result=$(echo "restore jobid=$selected_job client=$(hostname -s)-fd where=$restore_path yes" | bconsole 2>&1)
     
-    if echo "$restore_result" | grep -q "Restore OK"; then
+    if echo "$restore_result" | grep -Eiq "Restore OK|Job queued|Job started|OK"; then
         echo -e "${COLOR_GREEN}✓ $(t "restore_success")${COLOR_RESET}"
         echo -e "   ${COLOR_CYAN}$(t "msg_files_restored") $restore_path${COLOR_RESET}"
         echo -e "   ${COLOR_CYAN}Original Job: $original_job_name${COLOR_RESET}"
@@ -4768,6 +4874,16 @@ show_menu() {
     fi
     
     echo -e "  ${COLOR_DIM}Status: $install_status$remote_status${COLOR_RESET}"
+
+    # Extra brief status of services continuously
+    echo -e "  ${COLOR_DIM}Services:${COLOR_RESET}"
+    for svc in bacula-dir bacula-sd bacula-fd; do
+        if systemctl is-active --quiet $svc 2>/dev/null; then
+            echo -e "    ${COLOR_GREEN}✓ $svc is running${COLOR_RESET}"
+        else
+            echo -e "    ${COLOR_RED}✗ $svc is stopped${COLOR_RESET}"
+        fi
+    done
     echo ""
     
     echo -e "  ${COLOR_CYAN}1)${COLOR_RESET} $(t "menu_install")"
@@ -4787,8 +4903,8 @@ show_menu() {
     echo -e "${COLOR_YELLOW}  Management Options:${COLOR_RESET}"
     echo -e "  ${COLOR_CYAN}12)${COLOR_RESET} $(t "menu_config_reset")"
     echo -e "  ${COLOR_CYAN}13)${COLOR_RESET} $(t "menu_config_view")"
-    echo -e "  ${COLOR_CYAN}14)${COLOR_RESET} Email Notifications Status / Estado de Notificaciones"
-    echo -e "  ${COLOR_CYAN}15)${COLOR_RESET} Port Management / Gestión de Puertos"
+    echo -e "  ${COLOR_CYAN}14)${COLOR_RESET} $(t "menu_email_status")"
+    echo -e "  ${COLOR_CYAN}15)${COLOR_RESET} $(t "menu_port_management")"
     echo ""
     echo -e "  ${COLOR_RED}0)${COLOR_RESET} $(t "menu_exit")"
     echo ""
@@ -4807,7 +4923,7 @@ main() {
         read -rp "   $(t "select_option") [0-15]: " choice
         
         case $choice in
-            1) install_bacula ; configure_bacula ;;
+            1) install_bacula && configure_bacula ;;
             2) run_backup ;;
             3) restore_backup ;;
             4) view_status ;;
@@ -4875,9 +4991,19 @@ handle_args() {
             test_configuration
             exit 0
             ;;
+        --open-ports)
+            check_root
+            open_bacula_ports "backup"
+            exit 0
+            ;;
+        --close-ports)
+            check_root
+            open_bacula_ports "close"
+            exit 0
+            ;;
         --help|-h)
             echo ""
-            echo "Bacula Backup Manager - v2.0.0"
+            echo "Bacula Backup Manager - v${SCRIPT_VERSION}"
             echo ""
             echo "Usage: sudo $0 [OPTION]"
             echo ""
@@ -4888,12 +5014,15 @@ handle_args() {
             echo "  --status            View system status"
             echo "  --logs              View logs"
             echo "  --check             Run configuration tests"
+            echo "  --open-ports        Open Bacula firewall ports"
+            echo "  --close-ports       Close Bacula firewall ports"
             echo "  --help, -h          Show this help"
             echo ""
             echo "Examples:"
             echo "  sudo $0                    # Start menu"
             echo "  sudo $0 --install-command    # Install command"
             echo "  sudo baculamanager --status  # Quick status check"
+            echo "  sudo baculamanager --open-ports # Open firewall manually"
             echo ""
             exit 0
             ;;
