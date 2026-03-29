@@ -1258,11 +1258,25 @@ confirm() {
 detect_distro() {
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
-        echo "$ID"
+        # Primero intentamos clasificar por familia basándonos en ID e ID_LIKE
+        if [[ "$ID" =~ ^(debian|ubuntu|kali|linuxmint|pop|mx|raspbian|neon|parrot|deepin)$ ]] || [[ "${ID_LIKE:-}" =~ (debian|ubuntu) ]]; then
+            echo "debian-family"
+        elif [[ "$ID" =~ ^(rhel|centos|fedora|rocky|almalinux|oracle|amazon|scientific)$ ]] || [[ "${ID_LIKE:-}" =~ (rhel|fedora|centos) ]]; then
+            echo "rhel-family"
+        elif [[ "$ID" =~ ^(arch|manjaro|endeavouros|garuda)$ ]] || [[ "${ID_LIKE:-}" =~ (arch) ]]; then
+            echo "arch-family"
+        elif [[ "$ID" =~ ^(suse|opensuse|tumbleweed|leap)$ ]] || [[ "${ID_LIKE:-}" =~ (suse) ]]; then
+            echo "suse-family"
+        elif [[ "$ID" == "alpine" ]]; then
+            echo "alpine-family"
+        else
+            # Si no se detecta familia, devolver el ID original
+            echo "$ID"
+        fi
     elif [[ -f /etc/debian_version ]]; then
-        echo "debian"
+        echo "debian-family"
     elif [[ -f /etc/redhat-release ]]; then
-        echo "rhel"
+        echo "rhel-family"
     else
         echo "unknown"
     fi
@@ -1413,29 +1427,40 @@ install_bacula() {
     echo -e "${COLOR_CYAN}$(t "checking_deps")${COLOR_RESET}"
     
     # Verificar dependencias esenciales / Check essential dependencies
-    # Excluir PostgreSQL si ya está instalado para evitar conflictos
     local deps=("wget" "curl" "openssl")
     
     # Solo agregar PostgreSQL si no está instalado
     if [[ "$(detect_postgresql_version)" == "not_installed" ]]; then
-        deps+=("postgresql" "postgresql-contrib")
+        case "$distro" in
+            debian-family) deps+=("postgresql" "postgresql-contrib") ;;
+            rhel-family) deps+=("postgresql-server" "postgresql-contrib") ;;
+            arch-family) deps+=("postgresql") ;;
+            suse-family) deps+=("postgresql-server") ;;
+        esac
     fi
     
     local missing_deps=()
-    
     for dep in "${deps[@]}"; do
-        if ! dpkg -l | grep -q "^ii  $dep " 2>/dev/null; then
-            missing_deps+=("$dep")
-        fi
+        local installed=false
+        case "$distro" in
+            debian-family) dpkg -l | grep -q "^ii  $dep " 2>/dev/null && installed=true ;;
+            rhel-family|suse-family) rpm -q "$dep" &>/dev/null && installed=true ;;
+            arch-family) pacman -Qs "^$dep$" &>/dev/null && installed=true ;;
+            *) command -v "$dep" &>/dev/null && installed=true ;;
+        esac
+        [[ "$installed" == false ]] && missing_deps+=("$dep")
     done
     
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
         echo -e "${COLOR_YELLOW}⚠ $(t "installing"): ${missing_deps[*]}${COLOR_RESET}"
-        
         echo -e "${COLOR_CYAN}$(t "updating_repos")${COLOR_RESET}"
         (
-            apt-get update -qq
-            apt-get install -y -qq "${missing_deps[@]}"
+            case "$distro" in
+                debian-family) apt-get update -qq && apt-get install -y -qq "${missing_deps[@]}" ;;
+                rhel-family) dnf install -y -q "${missing_deps[@]}" ;;
+                arch-family) pacman -Sy --nocolor --noconfirm "${missing_deps[@]}" ;;
+                suse-family) zypper install -y "${missing_deps[@]}" ;;
+            esac
         ) &
         spinner $!
         wait $! || error_exit "$(t "install_error")"
@@ -1444,26 +1469,19 @@ install_bacula() {
     echo -e "${COLOR_CYAN}$(t "installing_bacula")${COLOR_RESET}"
     
     case "$distro" in
-        debian|ubuntu)
-            # Detectar versión de Debian/Ubuntu para compatibilidad
+        debian-family)
+            # Detectar versión para compatibilidad específica si es necesario
             local os_version="0"
             if [[ -f /etc/os-release ]]; then
-                os_version=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"' | cut -d. -f1 | tr -d '
-')
+                os_version=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"' | cut -d. -f1 | tr -d '\n')
             fi
-            if ! [[ "$os_version" =~ ^[0-9]+$ ]] || [[ -z "$os_version" ]] || [[ "$os_version" == "0" ]]; then
-                if [[ "$distro" == "debian" ]]; then os_version=11; else os_version=20; fi
-            fi
+            [[ -z "$os_version" ]] && os_version=20 # Default a valor moderno
             
-            # Verificar versión existente y decidir estrategia
             local pg_version
             pg_version=$(detect_postgresql_version)
             
             if [[ "$pg_version" != "not_installed" ]]; then
                 echo -e "   ${COLOR_YELLOW}⚠ $(t "postgresql_existing") $pg_version${COLOR_RESET}"
-                echo -e "   ${COLOR_INFO}$(t "postgresql_strategy")${COLOR_RESET}"
-                
-                # Usar PostgreSQL existente en lugar de instalar nueva versión
                 (
                     export DEBIAN_FRONTEND=noninteractive
                     apt-get update -qq
@@ -1472,28 +1490,9 @@ install_bacula() {
                 spinner $!
                 wait $! || error_exit "$(t "install_error")"
             else
-                # Instalar versión de PostgreSQL según versión del SO
-                local pg_package="postgresql-15"
-                
-                # Para Debian 9-10, usar PostgreSQL 11 (disponible en repos)
-                if [[ "$distro" == "debian" ]]; then
-                    if [[ "$os_version" -le 10 ]]; then
-                        pg_package="postgresql-11"
-                    elif [[ "$os_version" -le 11 ]]; then
-                        pg_package="postgresql-13"
-                    fi
-                fi
-                
-                # Para Ubuntu 18.04, usar PostgreSQL 10
-                if [[ "$distro" == "ubuntu" ]]; then
-                    if [[ "$os_version" -le 18 ]]; then
-                        pg_package="postgresql-10"
-                    elif [[ "$os_version" -le 20 ]]; then
-                        pg_package="postgresql-12"
-                    fi
-                fi
-                
-                echo -e "   ${COLOR_INFO}$(t "installing_postgresql_version") $pg_package${COLOR_RESET}"
+                local pg_package="postgresql"
+                # Lógica de versión para distros antiguas
+                if [[ "$os_version" -le 10 ]]; then pg_package="postgresql-11"; fi
                 
                 (
                     export DEBIAN_FRONTEND=noninteractive
@@ -1504,23 +1503,16 @@ install_bacula() {
                 wait $! || error_exit "$(t "install_error")"
             fi
             ;;
-        rhel|centos|fedora|rocky|almalinux)
-            # Para RHEL-based, verificar y usar versión del repositorio
+        rhel-family)
             local pg_version
             pg_version=$(detect_postgresql_version)
             
             if [[ "$pg_version" != "not_installed" ]]; then
                 echo -e "   ${COLOR_YELLOW}⚠ $(t "postgresql_existing") $pg_version${COLOR_RESET}"
-                echo -e "   ${COLOR_INFO}$(t "postgresql_strategy")${COLOR_RESET}"
-                
-                # Usar PostgreSQL existente
-                (
-                    dnf install -y -q bacula-director bacula-sd bacula-client bacula-console
-                ) &
+                ( dnf install -y -q bacula-director bacula-sd bacula-client bacula-console ) &
                 spinner $!
                 wait $! || error_exit "$(t "install_error")"
             else
-                # Instalar PostgreSQL del repositorio del sistema
                 (
                     dnf install -y -q bacula-director bacula-sd bacula-client bacula-console postgresql-server
                     postgresql-setup --initdb || true
@@ -1530,8 +1522,20 @@ install_bacula() {
                 wait $! || error_exit "$(t "install_error")"
             fi
             ;;
+        arch-family)
+            echo -e "   ${COLOR_INFO}Installing Bacula via Pacman...${COLOR_RESET}"
+            ( pacman -S --noconfirm --needed bacula-dir bacula-sd bacula-fd bacula-console ) &
+            spinner $!
+            wait $! || error_exit "$(t "install_error")"
+            ;;
+        suse-family)
+            echo -e "   ${COLOR_INFO}Installing Bacula via Zypper...${COLOR_RESET}"
+            ( zypper install -y bacula-director bacula-sd-mysql bacula-fd bacula-console ) & # SUSE a veces usa nombres mixtos
+            spinner $!
+            wait $! || error_exit "$(t "install_error")"
+            ;;
         *)
-            error_exit "$(t "install_error") - Distro no soportada / Unsupported distro"
+            error_exit "$(t "install_error") - Distro no soportada / Unsupported distro: $distro"
             ;;
     esac
     
