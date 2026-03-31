@@ -421,10 +421,10 @@ show_banner() {
     echo "║     ██████╔╝██║  ██║╚██████╗╚██████╔╝███████╗██║  ██║                     ║"
     echo "║     ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝                     ║"
     echo "║                                                                           ║"
-    echo "║              ENTERPRISE BACKUP MANAGER SOLUTION v${SCRIPT_VERSION}               ║"
+    echo "║              ENTERPRISE BACKUP MANAGER SOLUTION v${SCRIPT_VERSION}                  ║"
     echo "║                                                                           ║"
-    echo "║     Developer: ${AUTHOR}                            ║"
-    echo "║     ${TITLE}                               ║"
+    echo "║     Developer: ${AUTHOR}                                 ║"
+    echo "║     ${TITLE}                              ║"
     echo "║                                                                           ║"
     echo "╚═══════════════════════════════════════════════════════════════════════════╝"
     echo -e "${COLOR_RESET}"
@@ -5119,72 +5119,28 @@ read_menu_choice() {
     local max_choice="${3:-15}"
     local current_choice="${4:-1}"
 
-    echo -ne "${prompt} [${min_choice}-${max_choice}]: ${current_choice}"
+    echo -ne "${prompt} [${min_choice}-${max_choice}] (current: ${current_choice}): "
 
     while true; do
-        # Leer un carácter a la vez
-        local char
-        IFS= read -rsn1 -t 0.1 char 2>/dev/null
+        # Leer entrada del usuario
+        local input
+        read -r input
 
-        if [[ $? -ne 0 ]]; then
-            # Timeout - continuar esperando
-            continue
+        # Si no hay entrada (solo Enter), usar selección actual
+        if [[ -z "$input" ]]; then
+            echo "$current_choice"
+            return
         fi
 
-        case "$char" in
-            $'\e')  # Escape sequence (flechas)
-                read -rsn2 -t 0.1 seq 2>/dev/null
-                case "$seq" in
-                    "[A")  # Up arrow
-                        if [[ $current_choice -gt $min_choice ]]; then
-                            ((current_choice--))
-                            echo -ne "\r${prompt} [${min_choice}-${max_choice}]: ${current_choice}"
-                        fi
-                        ;;
-                    "[B")  # Down arrow
-                        if [[ $current_choice -lt $max_choice ]]; then
-                            ((current_choice++))
-                            echo -ne "\r${prompt} [${min_choice}-${max_choice}]: ${current_choice}"
-                        fi
-                        ;;
-                esac
-                ;;
-            [0-9])  # Número digitado
-                local num_input="$char"
-                echo -ne "\r${prompt} [${min_choice}-${max_choice}]: ${char}"
+        # Si es un número válido, retornarlo
+        if [[ "$input" =~ ^[0-9]+$ ]] && [[ "$input" -ge "$min_choice" ]] && [[ "$input" -le "$max_choice" ]]; then
+            echo "$input"
+            return
+        fi
 
-                # Leer más dígitos si los hay
-                while true; do
-                    IFS= read -rsn1 -t 0.1 next_char 2>/dev/null
-                    if [[ $? -ne 0 ]]; then
-                        # Timeout - procesar lo que tenemos
-                        break
-                    fi
-                    if [[ "$next_char" =~ [0-9] ]]; then
-                        num_input="$num_input$next_char"
-                        echo -n "$next_char"
-                    elif [[ "$next_char" == "" ]]; then
-                        # Enter presionado
-                        break
-                    fi
-                done
-
-                # Validar y retornar el número
-                if [[ "$num_input" =~ ^[0-9]+$ ]] && [[ "$num_input" -ge "$min_choice" ]] && [[ "$num_input" -le "$max_choice" ]]; then
-                    echo ""
-                    echo "$num_input"
-                    return
-                else
-                    echo -e "\n${COLOR_RED}Invalid option: $num_input (must be between $min_choice and $max_choice)${COLOR_RESET}"
-                    echo -ne "${prompt} [${min_choice}-${max_choice}]: ${current_choice}"
-                fi
-                ;;
-            "")  # Enter sin más input
-                echo ""
-                echo "$current_choice"
-                return
-                ;;
-        esac
+        # Si no es válido, mostrar error y pedir de nuevo
+        echo -e "${COLOR_RED}Invalid option: $input (must be between $min_choice and $max_choice)${COLOR_RESET}"
+        echo -ne "${prompt} [${min_choice}-${max_choice}] (current: ${current_choice}): "
     done
 }
 
@@ -5280,7 +5236,16 @@ read_line_edit() {
 }
 
 show_menu() {
+    echo "DEBUG: In show_menu"
     show_banner
+    echo "DEBUG: Banner shown, simplifying menu for debug"
+    
+    echo -e "${COLOR_BOLD}${COLOR_BLUE}MENU${COLOR_RESET}"
+    echo ""
+    echo "  1) Option 1"
+    echo "  0) Exit"
+    echo ""
+}
     
     local lang_indicator="🇪🇸"
     [[ "$APP_LANG" == "en" ]] && lang_indicator="🇺🇸"
@@ -5365,12 +5330,18 @@ show_menu() {
 
 # --- Bucle principal / Main loop ---
 main() {
+    echo "DEBUG: Starting main function"
     check_root
+    echo "DEBUG: Root check passed"
     check_lock
+    echo "DEBUG: Lock check passed"
     load_language
+    echo "DEBUG: Language loaded"
     
     while true; do
+        echo "DEBUG: About to show menu"
         show_menu
+        echo "DEBUG: Menu shown, about to read choice"
         
         choice=$(read_menu_choice "   $(t "select_option")" 0 15 1)
         
