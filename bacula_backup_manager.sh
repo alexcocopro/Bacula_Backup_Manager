@@ -46,7 +46,7 @@ declare -r COLOR_DIM='\033[2m'
 
 # Variables de idioma / Language variables
 # NOTA: Se usa APP_LANG para evitar colisión con la variable de sistema LANG (ej. es_ES.UTF-8)
-APP_LANG="${APP_LANG:-es}"
+APP_LANG="${APP_LANG:-en}"
 
 # Variables de conexión remota / Remote connection variables
 REMOTE_MODE="${REMOTE_MODE:-false}"
@@ -423,7 +423,7 @@ show_banner() {
     echo "║                                                                           ║"
     echo "║              ENTERPRISE BACKUP SOLUTION v${SCRIPT_VERSION}                        ║"
     echo "║                                                                           ║"
-    echo "║     Desarrollador: ${AUTHOR}                  ║"
+    echo "║     Developer: ${AUTHOR}                  ║"
     echo "║     ${TITLE}              ║"
     echo "║                                                                           ║"
     echo "╚═══════════════════════════════════════════════════════════════════════════╝"
@@ -2372,19 +2372,22 @@ check_bacula_ports() {
     
     echo -e "${COLOR_BOLD}Bacula Port Status / Estado de Puertos Bacula:${COLOR_RESET}"
     echo ""
+    echo -e "${COLOR_DIM}Note: These ports are used for Bacula communication between Director, Storage, and File daemons.${COLOR_RESET}"
+    echo -e "${COLOR_DIM}Notifications will include: port status, firewall rules, destination email, server info.${COLOR_RESET}"
+    echo ""
     
     for port in "${ports[@]}"; do
         local port_status="CLOSED"
-        local status_color="RED"
+        local status_color="COLOR_RED"
         
         # Verificar si el puerto está abierto
         if netstat -tuln 2>/dev/null | grep -q ":$port "; then
             port_status="OPEN"
-            status_color="GREEN"
+            status_color="COLOR_GREEN"
             ((open_count++))
         elif ss -tuln 2>/dev/null | grep -q ":$port "; then
             port_status="OPEN"
-            status_color="GREEN"
+            status_color="COLOR_GREEN"
             ((open_count++))
         fi
         
@@ -2512,6 +2515,12 @@ configure_email_notifications() {
     local email_config="$CONFIG_DIR/email.conf"
     
     echo -e "${COLOR_CYAN}Configure email notification settings / Configurar notificaciones por email:${COLOR_RESET}"
+    echo ""
+    echo -e "${COLOR_YELLOW}Note / Nota:${COLOR_RESET}"
+    echo -e "  - SMTP Username and Password are optional for some providers"
+    echo -e "  - For Gmail: Use smtp.gmail.com:587, enable 'Less secure app access' or use App Passwords"
+    echo -e "  - For local mail: Leave SMTP fields empty to use system's mail command"
+    echo -e "  - Notifications include: backup status, job details, server info, destination email"
     echo ""
     
     # Servidor SMTP
@@ -2722,12 +2731,12 @@ Job Configuration:
     
     # Determinar asunto y estado
     local subject_prefix="❌ FAILED"
-    local status_color="RED"
+    local status_color="COLOR_RED"
     local status_text="FAILED"
     
     if [[ "$job_status" == "success" ]]; then
         subject_prefix="✅ SUCCESS"
-        status_color="GREEN"
+        status_color="COLOR_GREEN"
         status_text="SUCCESS"
     fi
     
@@ -5050,14 +5059,22 @@ show_menu() {
     done
     echo ""
     
-    echo -e "  ${COLOR_CYAN}1)${COLOR_RESET} $(t "menu_install")"
-    echo -e "  ${COLOR_CYAN}2)${COLOR_RESET} $(t "menu_backup")"
-    echo -e "  ${COLOR_CYAN}3)${COLOR_RESET} $(t "menu_restore")"
-    echo -e "  ${COLOR_CYAN}4)${COLOR_RESET} $(t "menu_status")"
-    echo -e "  ${COLOR_CYAN}5)${COLOR_RESET} $(t "menu_configure")"
-    echo -e "  ${COLOR_CYAN}6)${COLOR_RESET} $(t "menu_logs")"
-    echo -e "  ${COLOR_CYAN}7)${COLOR_RESET} $(t "menu_test")"
-    echo -e "  ${COLOR_CYAN}8)${COLOR_RESET} $(t "menu_language")"
+    # Language toggle option
+    local lang_toggle
+    if [[ "$APP_LANG" == "en" ]]; then
+        lang_toggle="Translate to Spanish"
+    else
+        lang_toggle="Traducir al Inglés"
+    fi
+    
+    echo -e "  ${COLOR_CYAN}1)${COLOR_RESET} $lang_toggle"
+    echo -e "  ${COLOR_CYAN}2)${COLOR_RESET} $(t "menu_install")"
+    echo -e "  ${COLOR_CYAN}3)${COLOR_RESET} $(t "menu_backup")"
+    echo -e "  ${COLOR_CYAN}4)${COLOR_RESET} $(t "menu_restore")"
+    echo -e "  ${COLOR_CYAN}5)${COLOR_RESET} $(t "menu_status")"
+    echo -e "  ${COLOR_CYAN}6)${COLOR_RESET} $(t "menu_configure")"
+    echo -e "  ${COLOR_CYAN}7)${COLOR_RESET} $(t "menu_logs")"
+    echo -e "  ${COLOR_CYAN}8)${COLOR_RESET} $(t "menu_test")"
     echo ""
     echo -e "${COLOR_YELLOW}  Remote Backup Options:${COLOR_RESET}"
     echo -e "  ${COLOR_CYAN}9)${COLOR_RESET} $(t "menu_remote")"
@@ -5087,14 +5104,21 @@ main() {
         read -rp "   $(t "select_option") [0-15]: " choice
         
         case $choice in
-            1) install_bacula && configure_bacula ;;
-            2) run_backup ;;
-            3) restore_backup ;;
-            4) view_status ;;
-            5) configure_bacula ;;
-            6) view_logs ;;
-            7) test_configuration ;;
-            8) change_language ;;
+            1) 
+                if [[ "$APP_LANG" == "en" ]]; then
+                    APP_LANG="es"
+                else
+                    APP_LANG="en"
+                fi
+                continue
+                ;;
+            2) install_bacula && configure_bacula ;;
+            3) run_backup ;;
+            4) restore_backup ;;
+            5) view_status ;;
+            6) configure_bacula ;;
+            7) view_logs ;;
+            8) test_configuration ;;
             9) configure_remote_backup ;;
             10) manage_ssh_keys ;;
             11) test_network_connectivity ;;
