@@ -5121,7 +5121,8 @@ read_menu_choice() {
     local input
 
     while true; do
-        echo -ne "${prompt} [${min_choice}-${max_choice}]: "
+        # Prompt va a stderr para no contaminar el retorno
+        echo -ne "${prompt} [${min_choice}-${max_choice}]: " >&2
         read -r input
         
         # Eliminar espacios en blanco / Trim whitespace
@@ -5140,7 +5141,8 @@ read_menu_choice() {
             fi
         fi
         
-        echo -e "${COLOR_RED}Invalid option. Please enter a number between ${min_choice} and ${max_choice}.${COLOR_RESET}"
+        # Error también va a stderr
+        echo -e "${COLOR_RED}Invalid option. Please enter a number between ${min_choice} and ${max_choice}.${COLOR_RESET}" >&2
     done
 }
 
@@ -5287,6 +5289,43 @@ fix_bacula_permissions() {
     chmod 644 /var/log/bacula/bacula.log 2>/dev/null || true
 }
 
+# --- Pre-flight check para bacula-sd / Pre-flight check for bacula-sd ---
+preflight_check_bacula_sd() {
+    local error_log="/tmp/bacula_sd_error.log"
+    local config_file="/etc/bacula/bacula-sd.conf"
+    
+    # Verificar que el archivo de configuración existe
+    if [[ ! -f "$config_file" ]]; then
+        echo -e "    ${COLOR_RED}✗ Configuration file not found: $config_file${COLOR_RESET}"
+        return 1
+    fi
+    
+    # Ejecutar validación de configuración
+    echo -e "    ${COLOR_CYAN}→ Validating bacula-sd configuration...${COLOR_RESET}"
+    
+    if sudo bacula-sd -t -c "$config_file" > "$error_log" 2>&1; then
+        echo -e "    ${COLOR_GREEN}✓ Configuration validation passed${COLOR_RESET}"
+        rm -f "$error_log"
+        return 0
+    else
+        echo -e "    ${COLOR_RED}╔══════════════════════════════════════════════════════════════════╗${COLOR_RESET}"
+        echo -e "    ${COLOR_RED}║  ✗ Error fatal en la configuración de bacula-sd                  ║${COLOR_RESET}"
+        echo -e "    ${COLOR_RED}╚══════════════════════════════════════════════════════════════════╝${COLOR_RESET}"
+        echo ""
+        echo -e "    ${COLOR_YELLOW}Detalles del error:${COLOR_RESET}"
+        echo ""
+        # Mostrar el contenido del log de errores
+        while IFS= read -r line; do
+            echo -e "      ${COLOR_RED}$line${COLOR_RESET}"
+        done < "$error_log"
+        echo ""
+        echo -e "    ${COLOR_YELLOW}➤ El servicio no se iniciará hasta que se corrija la configuración.${COLOR_RESET}"
+        echo -e "    ${COLOR_DIM}  Use la opción 6 (Reconfigure) o edite manualmente:${COLOR_RESET}"
+        echo -e "    ${COLOR_DIM}    sudo nano $config_file${COLOR_RESET}"
+        return 1
+    fi
+}
+
 show_menu() {
     show_banner
     
@@ -5339,6 +5378,15 @@ show_menu() {
                     echo -e "    ${COLOR_YELLOW}⚠ $svc service not installed${COLOR_RESET}"
                     continue
                 fi
+                
+                # Para bacula-sd, ejecutar pre-flight check antes de iniciar
+                if [[ "$svc" == "bacula-sd" ]]; then
+                    if ! preflight_check_bacula_sd; then
+                        # El pre-flight check falló, no intentar iniciar
+                        continue
+                    fi
+                fi
+                
                 if systemctl start $svc 2>/dev/null; then
                     echo -e "    ${COLOR_GREEN}✓ $svc started${COLOR_RESET}"
                 else
@@ -5411,9 +5459,6 @@ main() {
         show_menu
         
         choice=$(read_menu_choice "   Select option" 0 15 1)
-        
-        # DEBUG: Mostrar valor recibido
-        echo -e "${COLOR_YELLOW}DEBUG: choice='${choice}' (hex: $(echo "$choice" | xxd -p 2>/dev/null || echo 'n/a'))${COLOR_RESET}"
         
         case $choice in
             1) 
