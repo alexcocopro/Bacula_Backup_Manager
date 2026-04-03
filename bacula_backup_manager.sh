@@ -2170,14 +2170,49 @@ Job {
 }
 EOF
     
-    # Reiniciar servicios para aplicar cambios - intentar múltiples nombres
+    # Reiniciar servicios para aplicar cambios - con pre-flight check y diagnóstico detallado
     echo -e "${COLOR_CYAN}Restarting Director service to apply changes...${COLOR_RESET}"
+    
+    # Validar configuración antes de reiniciar
+    if ! preflight_check_bacula_dir; then
+        echo -e "  ${COLOR_YELLOW}⚠ Director service restart aborted due to configuration errors${COLOR_RESET}"
+        echo ""
+        echo -e "  ${COLOR_CYAN}Pasos recomendados:${COLOR_RESET}"
+        echo -e "    1. Revisar los errores mostrados arriba"
+        echo -e "    2. Corregir la configuración: sudo nano /etc/bacula/bacula-dir.conf"
+        echo -e "    3. Validar manualmente: sudo bacula-dir -t -c /etc/bacula/bacula-dir.conf"
+        echo -e "    4. Reiniciar el servicio: sudo systemctl restart bacula-dir"
+        return 1
+    fi
+    
+    # Intentar reiniciar con nombres alternativos
+    local restart_success=false
+    local error_output=""
+    
     if systemctl restart bacula-dir 2>/dev/null; then
+        restart_success=true
         echo -e "  ${COLOR_GREEN}✓ bacula-dir restarted${COLOR_RESET}"
     elif systemctl restart bacula-director 2>/dev/null; then
+        restart_success=true
         echo -e "  ${COLOR_GREEN}✓ bacula-director restarted${COLOR_RESET}"
     else
-        echo -e "  ${COLOR_YELLOW}⚠ Director service restart failed${COLOR_RESET}"
+        # Capturar el error detallado
+        error_output=$(systemctl status bacula-dir 2>&1 || systemctl status bacula-director 2>&1 || echo "No se pudo obtener estado del servicio")
+    fi
+    
+    if [[ "$restart_success" == false ]]; then
+        echo -e "  ${COLOR_RED}✗ Director service restart failed${COLOR_RESET}"
+        echo ""
+        echo -e "  ${COLOR_YELLOW}Diagnóstico del error:${COLOR_RESET}"
+        echo ""
+        echo -e "  ${COLOR_DIM}$error_output${COLOR_RESET}" | head -20
+        echo ""
+        echo -e "  ${COLOR_CYAN}Pasos de solución:${COLOR_RESET}"
+        echo -e "    1. Verificar estado: sudo systemctl status bacula-dir"
+        echo -e "    2. Ver logs: sudo journalctl -u bacula-dir -n 50"
+        echo -e "    3. Validar config: sudo bacula-dir -t -c /etc/bacula/bacula-dir.conf"
+        echo -e "    4. Ver permisos: ls -la /etc/bacula/"
+        return 1
     fi
 }
 
@@ -2252,14 +2287,32 @@ delete_backup_job() {
         sed -i "/# Schedule for job: $job_name/,/^$/d" /etc/bacula/bacula-dir.conf
         sed -i "/# Restore job for: $job_name/,/^$/d" /etc/bacula/bacula-dir.conf
         
-        # Reiniciar servicios - intentar múltiples nombres
+        # Reiniciar servicios - con pre-flight check y diagnóstico detallado
         echo -e "${COLOR_CYAN}Restarting Director service to apply changes...${COLOR_RESET}"
+        
+        # Validar configuración antes de reiniciar
+        if ! preflight_check_bacula_dir; then
+            echo -e "  ${COLOR_YELLOW}⚠ Director service restart aborted due to configuration errors${COLOR_RESET}"
+            return 1
+        fi
+        
+        # Intentar reiniciar con nombres alternativos
+        local restart_success=false
+        
         if systemctl restart bacula-dir 2>/dev/null; then
+            restart_success=true
             echo -e "  ${COLOR_GREEN}✓ bacula-dir restarted${COLOR_RESET}"
         elif systemctl restart bacula-director 2>/dev/null; then
+            restart_success=true
             echo -e "  ${COLOR_GREEN}✓ bacula-director restarted${COLOR_RESET}"
-        else
-            echo -e "  ${COLOR_YELLOW}⚠ Director service restart failed${COLOR_RESET}"
+        fi
+        
+        if [[ "$restart_success" == false ]]; then
+            echo -e "  ${COLOR_RED}✗ Director service restart failed${COLOR_RESET}"
+            echo ""
+            echo -e "  ${COLOR_CYAN}Diagnóstico:${COLOR_RESET}"
+            echo -e "    - Verificar estado: sudo systemctl status bacula-dir"
+            echo -e "    - Ver logs: sudo journalctl -u bacula-dir -n 50"
         fi
         
         echo -e "${COLOR_GREEN}✓ Job '$job_name' deleted successfully!${COLOR_RESET}"
@@ -5221,6 +5274,44 @@ fix_bacula_permissions() {
     touch /var/log/bacula/bacula.log 2>/dev/null || true
     chown bacula:bacula /var/log/bacula/bacula.log 2>/dev/null || true
     chmod 644 /var/log/bacula/bacula.log 2>/dev/null || true
+}
+
+# --- Pre-flight check para bacula-dir / Pre-flight check for bacula-dir ---
+preflight_check_bacula_dir() {
+    local error_log="/tmp/bacula_dir_error.log"
+    local config_file="/etc/bacula/bacula-dir.conf"
+    
+    # Verificar que el archivo de configuración existe
+    if [[ ! -f "$config_file" ]]; then
+        echo -e "    ${COLOR_RED}✗ Configuration file not found: $config_file${COLOR_RESET}"
+        return 1
+    fi
+    
+    # Ejecutar validación de configuración
+    echo -e "    ${COLOR_CYAN}→ Validating bacula-dir configuration...${COLOR_RESET}"
+    
+    if sudo bacula-dir -t -c "$config_file" > "$error_log" 2>&1; then
+        echo -e "    ${COLOR_GREEN}✓ Configuration validation passed${COLOR_RESET}"
+        rm -f "$error_log"
+        return 0
+    else
+        echo -e "    ${COLOR_RED}╔══════════════════════════════════════════════════════════════════╗${COLOR_RESET}"
+        echo -e "    ${COLOR_RED}║  ✗ Error fatal en la configuración de bacula-dir                 ║${COLOR_RESET}"
+        echo -e "    ${COLOR_RED}╚══════════════════════════════════════════════════════════════════╝${COLOR_RESET}"
+        echo ""
+        echo -e "    ${COLOR_YELLOW}Detalles del error:${COLOR_RESET}"
+        echo ""
+        # Mostrar el contenido del log de errores
+        while IFS= read -r line; do
+            echo -e "      ${COLOR_RED}$line${COLOR_RESET}"
+        done < "$error_log"
+        echo ""
+        echo -e "    ${COLOR_YELLOW}➤ El servicio no se reiniciará hasta que se corrija la configuración.${COLOR_RESET}"
+        echo -e "    ${COLOR_DIM}  Use la opción 6 (Reconfigure) o edite manualmente:${COLOR_RESET}"
+        echo -e "    ${COLOR_DIM}    sudo nano $config_file${COLOR_RESET}"
+        rm -f "$error_log"
+        return 1
+    fi
 }
 
 # --- Pre-flight check para bacula-sd / Pre-flight check for bacula-sd ---
