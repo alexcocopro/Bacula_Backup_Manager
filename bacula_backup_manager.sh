@@ -5124,6 +5124,9 @@ read_menu_choice() {
         echo -ne "${prompt} [${min_choice}-${max_choice}]: "
         read -r input
         
+        # Eliminar espacios en blanco / Trim whitespace
+        input=$(echo "$input" | tr -d '[:space:]')
+        
         # Si no hay entrada, usar default
         if [[ -z "$input" ]]; then
             input="$default_choice"
@@ -5408,6 +5411,9 @@ main() {
         show_menu
         
         choice=$(read_menu_choice "   Select option" 0 15 1)
+        
+        # DEBUG: Mostrar valor recibido
+        echo -e "${COLOR_YELLOW}DEBUG: choice='${choice}' (hex: $(echo "$choice" | xxd -p 2>/dev/null || echo 'n/a'))${COLOR_RESET}"
         
         case $choice in
             1) 
