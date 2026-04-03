@@ -5146,95 +5146,29 @@ read_menu_choice() {
     done
 }
 
-# --- Leer entrada de texto con edición avanzada / Read text input with advanced editing ---
+# --- Leer entrada de texto simplificada / Read text input simplified ---
 read_line_edit() {
     local prompt="${1:-Enter text}"
     local default="${2:-}"
-    local input="${default}"
-    local cursor_pos=${#input}
+    local input
     
-    # Mostrar prompt inicial
-    echo -n "$prompt"
-    [[ -n "$default" ]] && echo -n " [$default]"
-    echo -n ": $input"
+    # Mostrar prompt con default
+    if [[ -n "$default" ]]; then
+        echo -ne "${prompt} [${default}]: " >&2
+    else
+        echo -ne "${prompt}: " >&2
+    fi
     
-    while true; do
-        # Leer un carácter
-        local char
-        IFS= read -rsn1 char
-        
-        case "$char" in
-            "")  # Enter
-                echo ""
-                echo "$input"
-                return
-                ;;
-            $'\e')  # Escape sequence (flechas)
-                read -rsn2 -t 0.1 seq
-                case "$seq" in
-                    "[C")  # Right arrow
-                        if [[ $cursor_pos -lt ${#input} ]]; then
-                            ((cursor_pos++))
-                        fi
-                        ;;
-                    "[D")  # Left arrow
-                        if [[ $cursor_pos -gt 0 ]]; then
-                            ((cursor_pos--))
-                        fi
-                        ;;
-                    "[H")  # Home
-                        cursor_pos=0
-                        ;;
-                    "[F")  # End
-                        cursor_pos=${#input}
-                        ;;
-                esac
-                ;;
-            $'\t')  # Tab - autocompletado para directorios
-                if [[ -n "$input" ]] && [[ "$input" =~ ^/ ]]; then
-                    local completions
-                    completions=$(compgen -d "$input" 2>/dev/null)
-                    if [[ $(echo "$completions" | wc -l) -eq 1 ]]; then
-                        input="$completions"
-                        cursor_pos=${#input}
-                    else
-                        echo ""
-                        echo "Possible completions:"
-                        echo "$completions" | head -10
-                        echo -n "$prompt: $input"
-                        cursor_pos=${#input}
-                    fi
-                fi
-                ;;
-            $'\177')  # Backspace
-                if [[ $cursor_pos -gt 0 ]]; then
-                    input="${input:0:$((cursor_pos-1))}${input:$cursor_pos}"
-                    ((cursor_pos--))
-                fi
-                ;;
-            $'\004')  # Ctrl+D (delete)
-                if [[ $cursor_pos -lt ${#input} ]]; then
-                    input="${input:0:$cursor_pos}${input:$((cursor_pos+1))}"
-                fi
-                ;;
-            *)  # Carácter normal
-                if [[ -n "$char" ]] && [[ "$char" != $'\n' ]]; then
-                    input="${input:0:$cursor_pos}$char${input:$cursor_pos}"
-                    ((cursor_pos++))
-                fi
-                ;;
-        esac
-        
-        # Redibujar línea
-        echo -ne "\r\033[K$prompt"
-        [[ -n "$default" ]] && echo -n " [$default]"
-        echo -n ": $input"
-        
-        # Posicionar cursor
-        if [[ $cursor_pos -gt 0 ]]; then
-            echo -ne "\033[${cursor_pos}D"
-        fi
-    done
+    # Leer entrada básica
+    read -r input
+    
+    # Si no hay entrada, usar default
+    if [[ -z "$input" ]] && [[ -n "$default" ]]; then
+        input="$default"
+    fi
+    
+    # Retornar solo el valor (a stdout)
+    echo "$input"
 }
 
 # --- Reparar permisos de Bacula / Fix Bacula permissions ---
@@ -5458,6 +5392,12 @@ main() {
     while true; do
         show_menu
         
+        # Verificar estado de instalación para opciones que lo requieren
+        local bacula_installed_check=false
+        if is_bacula_installed; then
+            bacula_installed_check=true
+        fi
+        
         choice=$(read_menu_choice "   Select option" 0 15 1)
         
         case $choice in
@@ -5471,7 +5411,7 @@ main() {
                 ;;
             2) install_bacula && configure_bacula ;;
             3) 
-                if [[ "$bacula_installed" == false ]]; then
+                if [[ "$bacula_installed_check" == false ]]; then
                     echo -e "${COLOR_RED}Error: Bacula is not installed. Please install first (option 2).${COLOR_RESET}"
                     read -rp "Press Enter to continue..."
                 else
@@ -5479,7 +5419,7 @@ main() {
                 fi
                 ;;
             4) 
-                if [[ "$bacula_installed" == false ]]; then
+                if [[ "$bacula_installed_check" == false ]]; then
                     echo -e "${COLOR_RED}Error: Bacula is not installed. Please install first (option 2).${COLOR_RESET}"
                     read -rp "Press Enter to continue..."
                 else
@@ -5487,7 +5427,7 @@ main() {
                 fi
                 ;;
             5) 
-                if [[ "$bacula_installed" == false ]]; then
+                if [[ "$bacula_installed_check" == false ]]; then
                     echo -e "${COLOR_RED}Error: Bacula is not installed. Please install first (option 2).${COLOR_RESET}"
                     read -rp "Press Enter to continue..."
                 else
@@ -5495,7 +5435,7 @@ main() {
                 fi
                 ;;
             6) 
-                if [[ "$bacula_installed" == false ]]; then
+                if [[ "$bacula_installed_check" == false ]]; then
                     echo -e "${COLOR_RED}Error: Bacula is not installed. Please install first (option 2).${COLOR_RESET}"
                     read -rp "Press Enter to continue..."
                 else
@@ -5503,7 +5443,7 @@ main() {
                 fi
                 ;;
             7) 
-                if [[ "$bacula_installed" == false ]]; then
+                if [[ "$bacula_installed_check" == false ]]; then
                     echo -e "${COLOR_RED}Error: Bacula is not installed. Please install first (option 2).${COLOR_RESET}"
                     read -rp "Press Enter to continue..."
                 else
@@ -5511,7 +5451,7 @@ main() {
                 fi
                 ;;
             8) 
-                if [[ "$bacula_installed" == false ]]; then
+                if [[ "$bacula_installed_check" == false ]]; then
                     echo -e "${COLOR_RED}Error: Bacula is not installed. Please install first (option 2).${COLOR_RESET}"
                     read -rp "Press Enter to continue..."
                 else
