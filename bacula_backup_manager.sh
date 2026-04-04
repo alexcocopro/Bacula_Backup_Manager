@@ -1826,6 +1826,100 @@ EOF
     echo -e "   ${COLOR_GREEN}✓ $(t "bacula_db_configured")${COLOR_RESET}"
 }
 
+# --- Sincronizar contraseña de base de datos / Sync database password ---
+fix_bacula_db_password_sync() {
+    echo -e "${COLOR_CYAN}Syncing Bacula database password...${COLOR_RESET}"
+    
+    local config_file="/etc/bacula/bacula-dir.conf"
+    local current_db_password=""
+    local config_db_password=""
+    
+    # Obtener contraseña actual del archivo de configuración
+    if [[ -f "$config_file" ]]; then
+        config_db_password=$(grep -E "^\s*dbpassword\s*=" "$config_file" | head -1 | sed 's/.*=\s*"\([^"]*\)".*/\1/')
+    fi
+    
+    # Si no hay contraseña en el archivo, usar "bacula" como default
+    if [[ -z "$config_db_password" ]]; then
+        config_db_password="bacula"
+    fi
+    
+    echo -e "   ${COLOR_DIM}Config password: ${config_db_password:0:10}...${COLOR_RESET}"
+    
+    # Verificar si PostgreSQL está corriendo
+    if ! systemctl is-active --quiet postgresql 2>/dev/null; then
+        echo -e "   ${COLOR_YELLOW}⚠ PostgreSQL not running, starting...${COLOR_RESET}"
+        systemctl start postgresql || {
+            echo -e "   ${COLOR_RED}✗ Failed to start PostgreSQL${COLOR_RESET}"
+            return 1
+        }
+    fi
+    
+    # Esperar a que PostgreSQL esté listo
+    local max_attempts=30
+    local attempt=0
+    while [[ $attempt -lt $max_attempts ]]; do
+        if su - postgres -c "pg_isready -q" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        ((attempt++))
+    done
+    
+    # Actualizar contraseña del usuario bacula en PostgreSQL
+    if su - postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='bacula'\"" 2>/dev/null | grep -q 1; then
+        echo -e "   ${COLOR_INFO}Updating bacula user password in PostgreSQL...${COLOR_RESET}"
+        su - postgres -c "psql -c \"ALTER USER bacula WITH PASSWORD '${config_db_password}';\"" 2>/dev/null || {
+            echo -e "   ${COLOR_RED}✗ Failed to update bacula user password${COLOR_RESET}"
+            return 1
+        }
+        echo -e "   ${COLOR_GREEN}✓ bacula user password updated${COLOR_RESET}"
+    else
+        # Crear usuario si no existe
+        echo -e "   ${COLOR_INFO}Creating bacula user...${COLOR_RESET}"
+        su - postgres -c "psql -c \"CREATE USER bacula WITH PASSWORD '${config_db_password}';\"" 2>/dev/null || {
+            echo -e "   ${COLOR_RED}✗ Failed to create bacula user${COLOR_RESET}"
+            return 1
+        }
+        echo -e "   ${COLOR_GREEN}✓ bacula user created${COLOR_RESET}"
+    fi
+    
+    # Verificar/crear base de datos
+    if ! su - postgres -c "psql -lqt" 2>/dev/null | cut -d \| -f1 | grep -qw bacula; then
+        echo -e "   ${COLOR_INFO}Creating bacula database...${COLOR_RESET}"
+        su - postgres -c "psql -c \"CREATE DATABASE bacula OWNER bacula;\"" 2>/dev/null || {
+            echo -e "   ${COLOR_RED}✗ Failed to create bacula database${COLOR_RESET}"
+            return 1
+        }
+        echo -e "   ${COLOR_GREEN}✓ bacula database created${COLOR_RESET}"
+    fi
+    
+    # Asegurar permisos
+    su - postgres -c "psql -c \"GRANT ALL PRIVILEGES ON DATABASE bacula TO bacula;\"" 2>/dev/null || true
+    
+    # Actualizar archivo de credenciales
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    cat > "$CONFIG_DIR/db_credentials.conf" << EOF
+DB_NAME=bacula
+DB_USER=bacula
+DB_PASSWORD=$config_db_password
+DB_HOST=localhost
+DB_PORT=5432
+EOF
+    chmod 600 "$CONFIG_DIR/db_credentials.conf"
+    
+    # Verificar conexión
+    echo -e "   ${COLOR_INFO}Testing database connection...${COLOR_RESET}"
+    if su - postgres -c "psql -d bacula -c 'SELECT 1;'" >/dev/null 2>&1; then
+        echo -e "   ${COLOR_GREEN}✓ Database connection successful${COLOR_RESET}"
+    else
+        echo -e "   ${COLOR_YELLOW}⚠ Database connection test failed${COLOR_RESET}"
+    fi
+    
+    return 0
+}
+
 # =============================================================================
 # FUNCIONES DE CONFIGURACIÓN MÚLTIPLE / MULTI-BACKUP CONFIGURATION FUNCTIONS
 # =============================================================================
@@ -5604,6 +5698,7 @@ show_menu() {
     echo -e "  ${COLOR_CYAN}13)${COLOR_RESET} $(t "menu_config_view")"
     echo -e "  ${COLOR_CYAN}14)${COLOR_RESET} $(t "menu_email_status")"
     echo -e "  ${COLOR_CYAN}15)${COLOR_RESET} $(t "menu_port_management")"
+    echo -e "  ${COLOR_CYAN}16)${COLOR_RESET} Fix Database Password Sync / Corregir Sync Contraseña BD"
     echo ""
     echo -e "  ${COLOR_RED}0)${COLOR_RESET} $(t "menu_exit")"
     echo ""
@@ -5625,7 +5720,7 @@ main() {
             bacula_installed_check=true
         fi
         
-        choice=$(read_menu_choice "   Select option" 0 15 1)
+        choice=$(read_menu_choice "   Select option" 0 16 1)
         
         case $choice in
             1) 
@@ -5692,6 +5787,7 @@ main() {
             13) view_full_config ;;
             14) view_notification_status ;;
             15) check_bacula_ports ;;
+            16) fix_bacula_db_password_sync && read -rp "Press Enter to continue..." ;;
             0) 
                 if confirm "$(t "exit_confirm")"; then
                     echo ""
