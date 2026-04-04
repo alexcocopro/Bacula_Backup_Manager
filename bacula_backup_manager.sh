@@ -2332,8 +2332,104 @@ add_job_to_bacula_config() {
     shift 8
     local include_paths=("$@")
     
-    # Verificar si existe configuración base / Check if base configuration exists
     local config_file="/etc/bacula/bacula-dir.conf"
+    
+    # LIMPIEZA AUTOMÁTICA DE DUPLICADOS / Automatic duplicate cleanup
+    echo -e "${COLOR_INFO}Checking for duplicate resources...${COLOR_RESET}"
+    
+    # Obtener todos los nombres de Client únicos que están duplicados
+    local client_names=$(grep -E "^\s*Name\s*=" "$config_file" 2>/dev/null | grep -B1 "Client {" | grep "Name" | sed 's/.*=\s*"\([^"]*\)".*/\1/' | sort | uniq -d)
+    
+    # Eliminar Client duplicados (mantener solo el primero)
+    for client_name in $client_names; do
+        if [[ -n "$client_name" ]]; then
+            echo -e "   ${COLOR_YELLOW}⚠ Removing duplicate Client: $client_name${COLOR_RESET}"
+            # Encontrar y eliminar duplicados (mantener el primero)
+            local first=true
+            local temp_file=$(mktemp)
+            local in_client=false
+            local skip_block=false
+            local current_client=""
+            
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^Client[[:space:]]*\{ ]]; then
+                    in_client=true
+                    current_client=""
+                    skip_block=false
+                elif [[ "$in_client" == true && "$line" =~ ^\s*Name[[:space:]]*="([^\"]+)" ]]; then
+                    current_client="${BASH_REMATCH[1]}"
+                    if [[ "$current_client" == "$client_name" ]]; then
+                        if [[ "$first" == true ]]; then
+                            first=false
+                        else
+                            skip_block=true
+                            in_client=false
+                        fi
+                    fi
+                elif [[ "$line" =~ ^\}[[:space:]]*$ && "$in_client" == true ]]; then
+                    in_client=false
+                    if [[ "$skip_block" == true ]]; then
+                        skip_block=false
+                        continue
+                    fi
+                fi
+                
+                if [[ "$skip_block" == false ]]; then
+                    echo "$line" >> "$temp_file"
+                fi
+            done < "$config_file"
+            
+            mv "$temp_file" "$config_file"
+        fi
+    done
+    
+    # Obtener todos los nombres de Storage únicos que están duplicados
+    local storage_names=$(grep -E "^\s*Name\s*=" "$config_file" 2>/dev/null | grep -B1 "Storage {" | grep "Name" | sed 's/.*=\s*"\([^"]*\)".*/\1/' | sort | uniq -d)
+    
+    # Eliminar Storage duplicados (mantener solo el primero)
+    for storage_name in $storage_names; do
+        if [[ -n "$storage_name" ]]; then
+            echo -e "   ${COLOR_YELLOW}⚠ Removing duplicate Storage: $storage_name${COLOR_RESET}"
+            # Encontrar y eliminar duplicados (mantener el primero)
+            local first=true
+            local temp_file=$(mktemp)
+            local in_storage=false
+            local skip_block=false
+            local current_storage=""
+            
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^Storage[[:space:]]*\{ ]]; then
+                    in_storage=true
+                    current_storage=""
+                    skip_block=false
+                elif [[ "$in_storage" == true && "$line" =~ ^\s*Name[[:space:]]*="([^\"]+)" ]]; then
+                    current_storage="${BASH_REMATCH[1]}"
+                    if [[ "$current_storage" == "$storage_name" ]]; then
+                        if [[ "$first" == true ]]; then
+                            first=false
+                        else
+                            skip_block=true
+                            in_storage=false
+                        fi
+                    fi
+                elif [[ "$line" =~ ^\}[[:space:]]*$ && "$in_storage" == true ]]; then
+                    in_storage=false
+                    if [[ "$skip_block" == true ]]; then
+                        skip_block=false
+                        continue
+                    fi
+                fi
+                
+                if [[ "$skip_block" == false ]]; then
+                    echo "$line" >> "$temp_file"
+                fi
+            done < "$config_file"
+            
+            mv "$temp_file" "$config_file"
+        fi
+    done
+    
+    # Verificar si existe configuración base / Check if base configuration exists
     local base_config_exists=true
     
     # Verificar que existan TODOS los recursos base necesarios
@@ -2509,9 +2605,28 @@ Schedule {
     $schedule_lines
 }
 
+  local client_name="$(hostname -s)-fd"
+    local storage_name="File1"
+    
+    # Verificar si Client ya existe
+    local client_exists=false
+    if grep -q "Name = $client_name" /etc/bacula/bacula-dir.conf 2>/dev/null; then
+        client_exists=true
+    fi
+    
+    # Verificar si Storage ya existe  
+    local storage_exists=false
+    if grep -q "Name = $storage_name" /etc/bacula/bacula-dir.conf 2>/dev/null | grep -q "Storage {"; then
+        storage_exists=true
+    fi
+    
+    # Solo crear Client si no existe
+    if [[ "$client_exists" == false ]]; then
+        cat >> /etc/bacula/bacula-dir.conf << EOF
+
 # Client resource for job: $job_name
 Client {
-    Name = $(hostname -s)-fd
+    Name = $client_name
     Address = 127.0.0.1
     FDPort = 9102
     Catalog = MyCatalog
@@ -2520,6 +2635,12 @@ Client {
     Job Retention = 6 months
     AutoPrune = yes
 }
+EOF
+    fi
+    
+    # Solo crear Storage si no existe
+    if [[ "$storage_exists" == false ]]; then
+        cat >> /etc/bacula/bacula-dir.conf << EOF
 
 # Storage resource for job: $job_name
 Storage {
@@ -2531,13 +2652,17 @@ Storage {
     Media Type = File
     Maximum Concurrent Jobs = 10
 }
+EOF
+    fi
+    
+    cat >> /etc/bacula/bacula-dir.conf << EOF
 
 # Job: $job_name
 Job {
     Name = "$job_name"
     Type = Backup
     Level = Incremental
-    Client = $(hostname -s)-fd
+    Client = $client_name
     FileSet = "$fileset_name"
     Schedule = "Schedule_${job_name}"
     Storage = $storage_name
@@ -2566,7 +2691,7 @@ Job {
 Job {
     Name = "Restore_${job_name}"
     Type = Restore
-    Client = $(hostname -s)-fd
+    Client = $client_name
     Storage = $storage_name
     FileSet = "$fileset_name"
     Pool = File
