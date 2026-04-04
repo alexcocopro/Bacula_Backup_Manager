@@ -1,8 +1,5 @@
-# Bacula_Backup_Manager
-Bacula Backup Manager is a user‑friendly interface for Bacula that simplifies backup management on Linux systems. It automates multiple backup jobs with scheduled runs, detailed reports, and searchable logs, while supporting secure remote backups to protect critical data.
-
-# Bacula Backup Manager
-# Gestor de Respaldo Bacula
+# Bacula Backup Manager v2.1.1 - Enhanced Compatibility
+# Gestor de Respaldo Bacula v2.1.1 - Compatibilidad Mejorada
 
 <div align="center">
 
@@ -123,7 +120,90 @@ Professional Linux backup system based on **Bacula**, designed to be **intuitive
 
 ## 🚀 Instalación / Installation
 
-### 1. Ejecutar el Script
+### Requisitos Previos / Prerequisites
+
+```bash
+# Actualizar sistema
+sudo apt-get update && sudo apt-get upgrade -y
+
+# Instalar dependencias básicas (si no están presentes)
+sudo apt-get install -y curl wget openssl
+
+# Verificar que tienes privilegios de root
+whoami  # Debe decir "root" o estar usando sudo
+```
+
+### Instalación Rápida / Quick Start
+
+#### **Paso 1: Descargar el Script**
+
+```bash
+# Clonar o descargar el script
+cd /tmp
+git clone <repository-url>  # Si está en git
+# O descargar directamente:
+wget -O bacula_backup_manager.sh <url-del-script>
+```
+
+#### **Paso 2: Dar Permisos y Ejecutar**
+
+```bash
+# Dar permisos de ejecución
+chmod +x bacula_backup_manager.sh
+
+# Ejecutar como root (REQUERIDO)
+sudo ./bacula_backup_manager.sh
+```
+
+#### **Paso 3: Seguir el Menú Interactivo**
+
+1. **Seleccionar idioma** (Opción 1)
+   - Español o Inglés
+
+2. **Instalar Bacula** (Opción 2)
+   - El script detectará automáticamente tu sistema
+   - Instalará PostgreSQL si no existe
+   - Configurará todos los componentes
+
+3. **Crear un Job de Respaldo** (después de la instalación)
+   - Seleccionar qué respaldar (Sistema completo, Home, Custom)
+   - Definir horario (ej: 02:00 AM)
+   - Establecer retención (30 días, 90 días, 1 año)
+
+#### **Paso 4: Verificar Instalación**
+
+```bash
+# Verificar estado de servicios
+sudo systemctl status postgresql bacula-dir bacula-sd bacula-fd
+
+# Verificar configuración
+sudo baculamanager --test
+
+# Ver logs
+sudo tail -f /var/log/bacula/bacula.log
+```
+
+---
+
+### Flujo de Instalación Automática
+
+Cuando ejecutas el script, el flujo automático es:
+
+```
+1. Detectar distribución Linux (Debian/Ubuntu/RHEL)
+2. Verificar PostgreSQL existente
+   ├── Si existe (v9+): Usarlo para Bacula
+   └── Si no existe: Instalar PostgreSQL compatible
+3. Instalar paquetes Bacula (director, storage, file daemon)
+4. Crear base de datos 'bacula' y usuario 'bacula'
+5. Generar configuraciones iniciales
+6. Iniciar servicios
+7. Crear comando 'baculamanager' global
+```
+
+---
+
+### 1. Ejecutar el Script (Método Manual Detallado)
 
 ```bash
 sudo chmod +x bacula_backup_manager.sh
@@ -716,89 +796,428 @@ sudo baculamanager --config-client --install-pg
 
 ## 🔧 Troubleshooting
 
-### **Problemas Comunes y Soluciones**
+### **Errores de Base de Datos PostgreSQL / PostgreSQL Database Errors**
 
-#### **1. PostgreSQL Conflict**
-```
-Error: PostgreSQL installation failed
-Symptom: Ya existe PostgreSQL con datos
-Solution: 
-  1. Usar opción --use-existing-pg
-  2. Hacer backup manual de PostgreSQL
-  3. Desinstalar PostgreSQL previo
-```
+#### **Error: "Could not open Catalog 'MyCatalog', database 'bacula'"**
 
-#### **2. Permission Denied**
-```
-Error: Permission denied accessing /etc/bacula-manager
-Solution:
-  1. Ejecutar con sudo: sudo ./bacula_backup_manager.sh
-  2. Verificar permisos: chmod 755 bacula_backup_manager.sh
-  3. Crear directorios: sudo mkdir -p /etc/bacula-manager
-```
+**Causa**: PostgreSQL no está configurado correctamente para Bacula.
 
-#### **3. SSH Connection Failed**
-```
-Error: SSH authentication failed
-Symptom: No se puede conectar al host remoto
-Solution:
-  1. Verificar conectividad: ping remote_host
-  2. Probar conexión manual: ssh user@remote_host
-  3. Regenerar claves: Opción 10 del menú
-  4. Verificar firewall: puerto 22 abierto
-```
+**Solución paso a paso:**
 
-#### **4. Service Not Starting**
-```
-Error: bacula-dir failed to start
-Symptom: Servicio no inicia
-Solution:
-  1. Verificar logs: journalctl -u bacula-dir
-  2. Validar configuración: sudo baculamanager --test
-  3. Revisar PostgreSQL: systemctl status postgresql
-  4. Reconfigurar: Opción 5 del menú
-```
+```bash
+# 1. Verificar que PostgreSQL esté instalado y corriendo
+sudo systemctl status postgresql
 
-#### **5. Backup Failed**
-```
-Error: Job backup.2024-01-15 failed
-Symptom: Respaldo falló
-Solution:
-  1. Verificar espacio en disco: df -h
-  2. Revisar logs: Opción 6 del menú
-  3. Probar manualmente: echo "run job=DailyBackup" | bconsole
-  4. Verificar conectividad remota: Opción 11
+# 2. Si no está instalado, instalarlo:
+sudo apt-get update
+sudo apt-get install postgresql postgresql-contrib
+
+# 3. Iniciar PostgreSQL
+sudo systemctl start postgresql
+sudo systemctl enable postgresql
+
+# 4. Verificar que esté corriendo
+sudo -u postgres pg_isready
+
+# 5. Crear usuario y base de datos de Bacula manualmente
+sudo -u postgres psql -c "CREATE USER bacula WITH PASSWORD 'bacula';"
+sudo -u postgres psql -c "CREATE DATABASE bacula OWNER bacula;"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE bacula TO bacula;"
+
+# 6. Verificar que se creó correctamente
+sudo -u postgres psql -l
+sudo -u postgres psql -c "\du"
+
+# 7. Guardar credenciales en archivo de configuración
+sudo mkdir -p /etc/bacula-manager
+sudo tee /etc/bacula-manager/db_credentials.conf << 'EOF'
+DB_NAME=bacula
+DB_USER=bacula
+DB_PASSWORD=bacula
+DB_HOST=localhost
+DB_PORT=5432
+EOF
+sudo chmod 600 /etc/bacula-manager/db_credentials.conf
+
+# 8. Actualizar configuración de Bacula con la contraseña
+sudo sed -i 's/dbpassword = .*/dbpassword = "bacula"/g' /etc/bacula/bacula-dir.conf
+
+# 9. Reiniciar servicios
+sudo systemctl restart postgresql
+sudo systemctl restart bacula-dir
 ```
 
-### **Comandos de Diagnóstico**
+---
+
+#### **Error: "Unable to connect to PostgreSQL server. Database=bacula User=bacula"**
+
+**Causas posibles:**
+- PostgreSQL no está corriendo
+- Contraseña incorrecta
+- Permisos de red (pg_hba.conf)
+- PostgreSQL escuchando solo en localhost
+
+**Solución:**
+
+```bash
+# 1. Verificar estado de PostgreSQL
+sudo systemctl status postgresql
+
+# 2. Si está stopped, iniciarlo
+sudo systemctl start postgresql
+
+# 3. Verificar configuración de autenticación
+sudo cat /etc/postgresql/*/main/pg_hba.conf | grep -v "^#" | grep -v "^$"
+
+# 4. Asegurar que tenga método 'trust' o 'md5' para local
+# Debe tener una línea como:
+# local   all             all                                     md5
+# o
+# local   all             all                                     trust
+
+# 5. Reiniciar PostgreSQL después de cambios
+sudo systemctl restart postgresql
+
+# 6. Verificar que el puerto está abierto
+sudo netstat -tlnp | grep 5432
+# o
+sudo ss -tlnp | grep 5432
+
+# 7. Probar conexión manual
+sudo -u postgres psql -d bacula -c "SELECT 1;"
+```
+
+---
+
+#### **Error: "PostgreSQL service is not running"**
+
+**Solución:**
+
+```bash
+# Iniciar PostgreSQL
+sudo systemctl start postgresql
+
+# Habilitar para inicio automático
+sudo systemctl enable postgresql
+
+# Verificar logs si falla
+sudo journalctl -u postgresql -n 50
+
+# Verificar espacio en disco (PostgreSQL no inicia sin espacio)
+df -h
+
+# Verificar permisos de directorio de datos
+sudo ls -la /var/lib/postgresql/
+```
+
+---
+
+### **Errores de Configuración Bacula / Bacula Configuration Errors**
+
+#### **Error: "Config error: Could not find config Resource 'ClientName-fd'"**
+
+**Causa**: Falta definición del recurso Client en bacula-dir.conf
+
+**Solución:**
+
+```bash
+# 1. Verificar que existe la definición de Client
+sudo grep -A 10 "^Client {" /etc/bacula/bacula-dir.conf
+
+# 2. Si no existe, agregarla:
+sudo tee -a /etc/bacula/bacula-dir.conf << 'EOF'
+
+Client {
+    Name = $(hostname -s)-fd
+    Address = 127.0.0.1
+    FDPort = 9102
+    Catalog = MyCatalog
+    Password = "$(openssl rand -base64 16 | tr -d '=+/')"
+    File Retention = 30 days
+    Job Retention = 6 months
+    AutoPrune = yes
+}
+EOF
+
+# 3. Validar configuración
+sudo bacula-dir -t -c /etc/bacula/bacula-dir.conf
+
+# 4. Reiniciar servicio
+sudo systemctl restart bacula-dir
+```
+
+---
+
+#### **Error: "Config error: Could not find config Resource 'File1'"**
+
+**Causa**: Falta definición del recurso Storage en bacula-dir.conf
+
+**Solución:**
+
+```bash
+# 1. Verificar que existe la definición de Storage
+sudo grep -A 10 "^Storage {" /etc/bacula/bacula-dir.conf
+
+# 2. Si no existe, agregarla:
+sudo tee -a /etc/bacula/bacula-dir.conf << 'EOF'
+
+Storage {
+    Name = File1
+    Address = 127.0.0.1
+    SDPort = 9103
+    Password = "$(openssl rand -base64 16 | tr -d '=+/')"
+    Device = FileStorage
+    Media Type = File
+    Maximum Concurrent Jobs = 10
+}
+EOF
+
+# 3. Validar configuración
+sudo bacula-dir -t -c /etc/bacula/bacula-dir.conf
+
+# 4. Reiniciar
+sudo systemctl restart bacula-dir
+```
+
+---
+
+#### **Error: "Director service restart failed"**
+
+**Pasos de diagnóstico:**
+
+```bash
+# 1. Verificar error específico
+sudo systemctl status bacula-dir
+
+# 2. Ver logs detallados
+sudo journalctl -u bacula-dir -n 100
+
+# 3. Validar sintaxis de configuración
+sudo bacula-dir -t -c /etc/bacula/bacula-dir.conf
+
+# 4. Si hay errores de configuración, ver archivo
+sudo cat /etc/bacula/bacula-dir.conf | head -50
+
+# 5. Reconfigurar desde cero si es necesario
+sudo ./bacula_backup_manager.sh
+# Luego seleccionar opción 6 (Reconfigure)
+
+# 6. Solución alternativa: recrear configuración base
+sudo cp /etc/bacula/bacula-dir.conf /etc/bacula/bacula-dir.conf.backup.$(date +%Y%m%d)
+sudo tee /etc/bacula/bacula-dir.conf << 'EOF'
+Director {
+    Name = $(hostname -s)-dir
+    DIRport = 9101
+    QueryFile = "/etc/bacula/scripts/query.sql"
+    WorkingDirectory = "/var/lib/bacula"
+    PidDirectory = "/run/bacula"
+    Maximum Concurrent Jobs = 20
+    Password = "$(openssl rand -base64 16 | tr -d '=+/')"
+    Messages = Daemon
+    DirAddress = 127.0.0.1
+}
+
+Catalog {
+    Name = MyCatalog
+    dbname = "bacula"
+    dbuser = "bacula"
+    dbpassword = "bacula"
+}
+EOF
+```
+
+---
+
+### **Errores de Instalación / Installation Errors**
+
+#### **Error: "bacula_installed: unbound variable"**
+
+**Causa**: Variable no inicializada en el script
+
+**Solución**: Ya está corregido en versiones recientes. Si persiste:
+
+```bash
+# Ejecutar instalación primero
+sudo ./bacula_backup_manager.sh
+# Seleccionar opción 2 para instalar
+```
+
+---
+
+#### **Error: "No internet connectivity detected"**
+
+**Solución:**
+
+```bash
+# Verificar conectividad
+ping -c 3 google.com
+
+# Si no hay internet, instalar paquetes manualmente
+sudo apt-get install -f  # Reintentar con caché local
+
+# O descargar paquetes .deb manualmente en otro equipo
+# y transferirlos vía USB/scp
+
+# Instalar desde archivos locales
+sudo dpkg -i /path/to/bacula-*.deb
+sudo apt-get install -f  # Resolver dependencias
+```
+
+---
+
+### **Errores de Respaldo / Backup Errors**
+
+#### **Error: "Backup failed" o "Job terminated with errors"**
+
+**Diagnóstico:**
+
+```bash
+# 1. Verificar espacio en disco
+df -h
+
+# 2. Verificar estado de servicios
+sudo systemctl status bacula-dir bacula-sd bacula-fd
+
+# 3. Ver logs de Bacula
+sudo tail -n 100 /var/log/bacula/bacula.log
+
+# 4. Verificar permisos del directorio de respaldo
+sudo ls -la /backups/
+sudo chown -R bacula:bacula /backups/
+sudo chmod 750 /backups/
+
+# 5. Probar backup manualmente
+echo "run job=BackupLocalFiles yes" | sudo bconsole
+
+# 6. Verificar conexión entre componentes
+echo "status director" | sudo bconsole
+echo "status storage" | sudo bconsole
+echo "status client" | sudo bconsole
+```
+
+---
+
+### **Errores de Permisos / Permission Errors**
+
+#### **Error: "Permission denied accessing /etc/bacula-manager"**
+
+**Solución:**
+
+```bash
+# Crear directorios con permisos correctos
+sudo mkdir -p /etc/bacula-manager /var/log/bacula-manager
+sudo chmod 700 /etc/bacula-manager
+sudo chmod 755 /var/log/bacula-manager
+sudo chown -R root:root /etc/bacula-manager
+
+# Para directorio de Bacula
+sudo mkdir -p /etc/bacula /var/lib/bacula /var/log/bacula
+sudo chown -R root:bacula /etc/bacula
+sudo chmod 755 /etc/bacula
+sudo chmod 640 /etc/bacula/*.conf
+sudo chown -R bacula:bacula /var/lib/bacula /var/log/bacula
+```
+
+---
+
+### **Errores de SSH / Remote Backup Errors**
+
+#### **Error: "SSH authentication failed"**
+
+**Solución:**
+
+```bash
+# 1. Verificar conectividad de red
+ping remote_host
+
+# 2. Verificar puerto SSH
+nc -zv remote_host 22
+
+# 3. Probar conexión SSH manual
+ssh -i /root/.ssh/bacula_backup user@remote_host
+
+# 4. Regenerar claves SSH desde el menú del script
+sudo ./bacula_backup_manager.sh
+# Opción 10 -> Generar nuevas claves
+
+# 5. Verificar permisos de claves
+sudo chmod 600 /root/.ssh/bacula_backup
+sudo chmod 644 /root/.ssh/bacula_backup.pub
+
+# 6. Agregar clave al agente SSH
+sudo ssh-add /root/.ssh/bacula_backup
+```
+
+---
+
+### **Comandos de Diagnóstico Rápido / Quick Diagnostic Commands**
 
 ```bash
 # Verificar instalación completa
 sudo baculamanager --check
 
-# Validar configuración
+# Validar todas las configuraciones
 sudo baculamanager --test
 
 # Ver estado detallado
 sudo baculamanager --status
 
+# Ver configuración completa
+sudo baculamanager --config
+
 # Logs en tiempo real
-sudo tail -f /var/log/bacula-manager/manager.log
+tail -f /var/log/bacula/bacula.log
+tail -f /var/log/bacula-manager/manager.log
 
 # Verificar PostgreSQL
-sudo -u postgres psql -l
+sudo -u postgres psql -c "\l"
+sudo -u postgres psql -d bacula -c "\dt"
 
-# Probar conexión remota
-sudo baculamanager --test-remote
+# Verificar configuración Bacula
+sudo bacula-dir -t -c /etc/bacula/bacula-dir.conf
+sudo bacula-sd -t -c /etc/bacula/bacula-sd.conf
+
+# Estado de todos los servicios
+sudo systemctl status postgresql bacula-dir bacula-sd bacula-fd
+
+# Espacio en disco
+df -h /backups /var/lib/bacula
 ```
 
-### **Recursos de Ayuda**
+---
+
+### **Recuperación Completa / Full Recovery**
+
+Si todo falla, restaurar desde cero:
+
+```bash
+# 1. Detener todos los servicios
+sudo systemctl stop bacula-dir bacula-sd bacula-fd postgresql
+
+# 2. Backup de configuraciones existentes
+sudo tar czf ~/bacula-backup-$(date +%Y%m%d).tar.gz /etc/bacula /etc/bacula-manager 2>/dev/null || true
+
+# 3. Limpiar configuraciones
+sudo rm -rf /etc/bacula/*.conf
+sudo rm -rf /etc/bacula-manager/*
+
+# 4. Recrear base de datos
+sudo -u postgres dropdb bacula 2>/dev/null || true
+sudo -u postgres dropuser bacula 2>/dev/null || true
+
+# 5. Volver a ejecutar el script
+sudo ./bacula_backup_manager.sh
+# Seleccionar opción 2 (Instalar y Configurar)
+```
+
+---
+
+### **Contacto y Soporte**
 
 - 📖 **Documentación completa**: Este README.md
 - 🐛 **Reporte de bugs**: GitHub Issues
-- 💬 **Soporte técnico**: Email/Slack
-- 📹 **Tutoriales video**: YouTube Channel
-- 🎓 **Capacitación**: Webinars mensuales
+- 💬 **Soporte técnico**: alex.cabello@example.com
+- 📹 **Tutoriales video**: Canal de YouTube
 
 ---
 

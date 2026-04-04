@@ -2131,9 +2131,19 @@ Messages {
 EOF
         
         echo -e "${COLOR_GREEN}✓ Base configuration created${COLOR_RESET}"
+        
+        # Configurar base de datos PostgreSQL / Setup PostgreSQL database
+        echo -e "${COLOR_CYAN}Setting up Bacula database...${COLOR_RESET}"
+        setup_bacula_database || {
+            echo -e "${COLOR_YELLOW}⚠ Database setup had issues, but continuing...${COLOR_RESET}"
+        }
     fi
     
-    # Calcular valores de retención
+    # Verificar que la base de datos esté configurada / Verify database is configured
+    if [[ ! -f "$CONFIG_DIR/db_credentials.conf" ]]; then
+        echo -e "${COLOR_CYAN}Initializing database configuration...${COLOR_RESET}"
+        setup_bacula_database || true
+    fi
     local vol_retention job_retention file_retention
     case "$retention" in
         1) vol_retention="30 days"; job_retention="30 days"; file_retention="30 days" ;;
@@ -3452,6 +3462,20 @@ generate_bacula_config() {
     local job_retention
     local file_retention
     
+    # Configurar base de datos si no está configurada / Setup database if not configured
+    if [[ ! -f "$CONFIG_DIR/db_credentials.conf" ]]; then
+        echo -e "${COLOR_CYAN}Initializing Bacula database...${COLOR_RESET}"
+        setup_bacula_database || {
+            echo -e "${COLOR_YELLOW}⚠ Database setup may have issues${COLOR_RESET}"
+        }
+    fi
+    
+    # Obtener contraseña de la base de datos / Get database password
+    local db_password="bacula"
+    if [[ -f "$CONFIG_DIR/db_credentials.conf" ]]; then
+        db_password=$(grep DB_PASSWORD "$CONFIG_DIR/db_credentials.conf" | cut -d= -f2)
+    fi
+    
     case $retention in
         1) vol_retention="30 days"; job_retention="30 days"; file_retention="30 days" ;;
         2) vol_retention="90 days"; job_retention="90 days"; file_retention="90 days" ;;
@@ -3582,7 +3606,7 @@ Catalog {
     Name = MyCatalog
     dbname = "bacula"
     dbuser = "bacula"
-    dbpassword = "$(grep DB_PASSWORD $CONFIG_DIR/db_credentials.conf | cut -d= -f2)"
+    dbpassword = "$db_password"
 }
 
 Pool {
