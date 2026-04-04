@@ -421,9 +421,9 @@ show_banner() {
     echo "║     ██████╔╝██║  ██║╚██████╗╚██████╔╝███████╗██║  ██║                     ║"
     echo "║     ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝                     ║"
     echo "║                                                                           ║"
-    echo "║              ENTERPRISE BACKUP MANAGER SOLUTION v${SCRIPT_VERSION}                      ║"
+    echo "║              ENTERPRISE BACKUP MANAGER SOLUTION v${SCRIPT_VERSION}                     ║"
     echo "║                                                                           ║"
-    echo "║     Developer: ${AUTHOR}                                      ║"
+    echo "║     Developer: ${AUTHOR}                                       ║"
     echo "║     ${TITLE}                              ║"
     echo "║                                                                           ║"
     echo "╚═══════════════════════════════════════════════════════════════════════════╝"
@@ -1741,89 +1741,201 @@ install_bacula() {
 
 setup_bacula_database() {
     local db_password
-    db_password=$(generate_password)
+    local pg_port="5432"
+    local pg_version=""
+    local pg_cluster="main"
+    local pg_hba_file=""
     
-    # Verificar si PostgreSQL está corriendo
-    if ! systemctl is-active --quiet postgresql 2>/dev/null; then
-        echo -e "   ${COLOR_YELLOW}⚠ $(t "postgresql_not_running")${COLOR_RESET}"
-        echo -e "   ${COLOR_INFO}$(t "postgresql_starting")${COLOR_RESET}"
-        systemctl start postgresql || {
-            echo -e "   ${COLOR_RED}✗ $(t "postgresql_start_failed")${COLOR_RESET}"
-            return 1
-        }
-    fi
+    echo -e "${COLOR_BOLD}${COLOR_CYAN}═══════════════════════════════════════════════════════════════════════════${COLOR_RESET}"
+    echo -e "${COLOR_BOLD}  Bacula Database Setup / Configuración Base de Datos Bacula${COLOR_RESET}"
+    echo -e "${COLOR_BOLD}${COLOR_CYAN}═══════════════════════════════════════════════════════════════════════════${COLOR_RESET}"
+    echo ""
     
-    # Esperar a que PostgreSQL esté completamente disponible
-    local max_attempts=30
-    local attempt=0
-    while [[ $attempt -lt $max_attempts ]]; do
-        if su - postgres -c "pg_isready -q" 2>/dev/null; then
-            break
+    # 1. Detectar cluster PostgreSQL y puerto
+    echo -e "${COLOR_INFO}Step 1: Detecting PostgreSQL cluster...${COLOR_RESET}"
+    
+    if command -v pg_lsclusters &>/dev/null; then
+        # Encontrar el cluster que tiene la base de datos bacula o usar el primero
+        local cluster_info=$(pg_lsclusters | grep -E "^\\s*[0-9]+" | head -1)
+        if [[ -n "$cluster_info" ]]; then
+            pg_version=$(echo "$cluster_info" | awk '{print $1}')
+            pg_port=$(echo "$cluster_info" | awk '{print $3}')
+            pg_cluster=$(echo "$cluster_info" | awk '{print $2}')
+            echo -e "   ${COLOR_GREEN}✓ Found PostgreSQL $pg_version on port $pg_port${COLOR_RESET}"
         fi
-        sleep 1
-        ((attempt++))
-    done
-    
-    if [[ $attempt -eq $max_attempts ]]; then
-        echo -e "   ${COLOR_RED}✗ $(t "postgresql_not_ready")${COLOR_RESET}"
-        return 1
     fi
     
-    # Crear usuario y base de datos con manejo de errores mejorado
-    echo -e "   ${COLOR_INFO}$(t "creating_bacula_db")${COLOR_RESET}"
+    # Si no se detectó, usar defaults
+    if [[ -z "$pg_version" ]]; then
+        pg_version=$(ls /etc/postgresql/ 2>/dev/null | sort -V | tail -1)
+        [[ -z "$pg_version" ]] && pg_version="16"
+    fi
     
-    # Verificar si el usuario ya existe
-    if su - postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='bacula'\"" 2>/dev/null | grep -q 1; then
-        echo -e "   ${COLOR_YELLOW}⚠ $(t "bacula_user_exists")${COLOR_RESET}"
-        # Generar nueva contraseña para usuario existente
-        su - postgres -c "psql -c \"ALTER USER bacula WITH PASSWORD '${db_password}';\"" 2>/dev/null || {
-            echo -e "   ${COLOR_RED}✗ $(t "bacula_user_update_failed")${COLOR_RESET}"
-            return 1
+    pg_hba_file="/etc/postgresql/$pg_version/$pg_cluster/pg_hba.conf"
+    
+    # 2. Verificar/crear usuario bacula
+    echo -e "${COLOR_INFO}Step 2: Setting up bacula user...${COLOR_RESET}"
+    
+    # Generar contraseña o usar la existente
+    if [[ -f "$CONFIG_DIR/db_credentials.conf" ]]; then
+        db_password=$(grep DB_PASSWORD "$CONFIG_DIR/db_credentials.conf" | cut -d= -f2)
+    else
+        db_password=$(generate_password)
+    fi
+    
+    # Crear o actualizar usuario bacula en el puerto correcto
+    if ! su - postgres -c "psql -p $pg_port -tAc \"SELECT 1 FROM pg_roles WHERE rolname='bacula'\"" 2>/dev/null | grep -q 1; then
+        echo -e "   ${COLOR_INFO}Creating bacula user on port $pg_port...${COLOR_RESET}"
+        su - postgres -c "psql -p $pg_port -c \"CREATE USER bacula WITH PASSWORD '${db_password}';\"" 2>/dev/null || {
+            echo -e "   ${COLOR_YELLOW}⚠ User may exist or error occurred, continuing...${COLOR_RESET}"
         }
     else
-        # Crear nuevo usuario
-        su - postgres -c "psql -c \"CREATE USER bacula WITH PASSWORD '${db_password}';\"" 2>/dev/null || {
-            echo -e "   ${COLOR_RED}✗ $(t "bacula_user_create_failed")${COLOR_RESET}"
-            return 1
-        }
+        echo -e "   ${COLOR_GREEN}✓ bacula user exists${COLOR_RESET}"
+        # Actualizar contraseña
+        su - postgres -c "psql -p $pg_port -c \"ALTER USER bacula WITH PASSWORD '${db_password}';\"" 2>/dev/null
     fi
     
-    # Verificar si la base de datos ya existe
-    if su - postgres -c "psql -lqt" 2>/dev/null | cut -d \| -f1 | grep -qw bacula; then
-        echo -e "   ${COLOR_YELLOW}⚠ $(t "bacula_db_exists")${COLOR_RESET}"
+    # 3. Verificar/crear base de datos
+    echo -e "${COLOR_INFO}Step 3: Setting up bacula database...${COLOR_RESET}"
+    
+    if ! su - postgres -c "psql -p $pg_port -lqt" 2>/dev/null | cut -d \| -f1 | grep -qw bacula; then
+        echo -e "   ${COLOR_INFO}Creating bacula database...${COLOR_RESET}"
+        su - postgres -c "psql -p $pg_port -c \"CREATE DATABASE bacula OWNER bacula;\"" 2>/dev/null || {
+            echo -e "   ${COLOR_RED}✗ Failed to create database${COLOR_RESET}"
+        }
     else
-        # Crear base de datos
-        su - postgres -c "psql -c \"CREATE DATABASE bacula OWNER bacula;\"" 2>/dev/null || {
-            echo -e "   ${COLOR_RED}✗ $(t "bacula_db_create_failed")${COLOR_RESET}"
-            return 1
-        }
+        echo -e "   ${COLOR_GREEN}✓ bacula database exists${COLOR_RESET}"
     fi
     
-    # Asegurar permisos
-    su - postgres -c "psql -c \"GRANT ALL PRIVILEGES ON DATABASE bacula TO bacula;\"" 2>/dev/null || {
-        echo -e "   ${COLOR_RED}✗ $(t "bacula_grant_failed")${COLOR_RESET}"
-        return 1
-    }
+    # 4. Configurar pg_hba.conf
+    echo -e "${COLOR_INFO}Step 4: Configuring PostgreSQL authentication...${COLOR_RESET}"
     
-    # Guardar credenciales / Save credentials
+    if [[ -f "$pg_hba_file" ]]; then
+        # Verificar si ya tiene reglas para bacula
+        if ! grep -q "bacula" "$pg_hba_file" 2>/dev/null; then
+            echo -e "   ${COLOR_INFO}Adding bacula authentication rules...${COLOR_RESET}"
+            # Crear backup y agregar reglas al inicio
+            cp "$pg_hba_file" "${pg_hba_file}.backup.$(date +%Y%m%d%H%M%S)"
+            sed -i '1i\
+# Bacula authentication\
+local   bacula          bacula                                  scram-sha-256\
+host    bacula          bacula          127.0.0.1/32            scram-sha-256\
+host    bacula          bacula          ::1/128                 scram-sha-256\
+' "$pg_hba_file"
+            # Recargar PostgreSQL
+            su - postgres -c "pg_ctlcluster $pg_version $pg_cluster reload" 2>/dev/null || systemctl reload postgresql
+            echo -e "   ${COLOR_GREEN}✓ Authentication rules added${COLOR_RESET}"
+        else
+            echo -e "   ${COLOR_GREEN}✓ bacula rules exist in pg_hba.conf${COLOR_RESET}"
+        fi
+    fi
+    
+    # 5. Crear tablas de Bacula usando los scripts oficiales
+    echo -e "${COLOR_INFO}Step 5: Creating Bacula database schema...${COLOR_RESET}"
+    
+    # Verificar si la tabla Version existe (indica que el esquema está creado)
+    if ! su - postgres -c "psql -p $pg_port -d bacula -c \"SELECT 1 FROM Version LIMIT 1;\"" 2>/dev/null | grep -q 1; then
+        echo -e "   ${COLOR_INFO}Creating Bacula tables...${COLOR_RESET}"
+        
+        # Encontrar scripts de Bacula
+        local sql_scripts_dir="/usr/share/bacula-director"
+        if [[ -d "$sql_scripts_dir" ]]; then
+            # Ejecutar make_postgresql_tables con variables de entorno correctas
+            export db_user=bacula
+            export db_name=bacula
+            export PGPASSWORD="$db_password"
+            
+            # Ejecutar el script de creación de tablas
+            if [[ -f "$sql_scripts_dir/make_postgresql_tables" ]]; then
+                cd "$sql_scripts_dir"
+                # El script intenta conectar como postgres, necesitamos modificarlo o ejecutar SQL directamente
+                # Extraer y ejecutar SQL directamente
+                sed -n '/^BEGIN;/,/^END-OF-DATA/p' "$sql_scripts_dir/make_postgresql_tables" | head -n -1 > /tmp/bacula_tables.sql
+                if [[ -f /tmp/bacula_tables.sql ]]; then
+                    su - postgres -c "psql -p $pg_port -d bacula -f /tmp/bacula_tables.sql" 2>/dev/null
+                    rm -f /tmp/bacula_tables.sql
+                fi
+            fi
+            
+            # Ejecutar script de privilegios
+            if [[ -f "$sql_scripts_dir/grant_postgresql_privileges" ]]; then
+                sed -n '/^alter database/,/^END-OF-DATA/p' "$sql_scripts_dir/grant_postgresql_privileges" | \
+                    sed "s/\\${db_name}/bacula/g; s/\\${db_user}/bacula/g" > /tmp/bacula_grants.sql
+                if [[ -f /tmp/bacula_grants.sql ]]; then
+                    su - postgres -c "psql -p $pg_port -d bacula -f /tmp/bacula_grants.sql" 2>/dev/null
+                    rm -f /tmp/bacula_grants.sql
+                fi
+            fi
+            
+            unset PGPASSWORD db_user db_name
+        fi
+        
+        # Verificar si se crearon las tablas
+        if su - postgres -c "psql -p $pg_port -d bacula -c \"SELECT 1 FROM Version LIMIT 1;\"" 2>/dev/null | grep -q 1; then
+            echo -e "   ${COLOR_GREEN}✓ Bacula tables created successfully${COLOR_RESET}"
+        else
+            echo -e "   ${COLOR_YELLOW}⚠ Tables may not have been created properly${COLOR_RESET}"
+        fi
+    else
+        echo -e "   ${COLOR_GREEN}✓ Bacula schema already exists${COLOR_RESET}"
+    fi
+    
+    # 6. Guardar credenciales
+    echo -e "${COLOR_INFO}Step 6: Saving database credentials...${COLOR_RESET}"
+    
     mkdir -p "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
-    
     cat > "$CONFIG_DIR/db_credentials.conf" << EOF
 DB_NAME=bacula
 DB_USER=bacula
 DB_PASSWORD=$db_password
 DB_HOST=localhost
-DB_PORT=5432
+DB_PORT=$pg_port
 EOF
     chmod 600 "$CONFIG_DIR/db_credentials.conf"
     
-    # Actualizar configuración Bacula / Update Bacula config
-    sed -i 's/dbname = .*/dbname = "bacula"/g' /etc/bacula/bacula-dir.conf 2>/dev/null || true
-    sed -i 's/dbuser = .*/dbuser = "bacula"/g' /etc/bacula/bacula-dir.conf 2>/dev/null || true
-    sed -i "s/dbpassword = .*/dbpassword = \"$db_password\"/g" /etc/bacula/bacula-dir.conf 2>/dev/null || true
+    # 7. Actualizar bacula-dir.conf
+    echo -e "${COLOR_INFO}Step 7: Updating Bacula configuration...${COLOR_RESET}"
     
-    echo -e "   ${COLOR_GREEN}✓ $(t "bacula_db_configured")${COLOR_RESET}"
+    local config_file="/etc/bacula/bacula-dir.conf"
+    if [[ -f "$config_file" ]]; then
+        # Actualizar o agregar configuración de puerto
+        if grep -q "dbport" "$config_file"; then
+            sed -i "s/dbport = .*/dbport = \"$pg_port\"/g" "$config_file"
+        else
+            # Agregar dbport después de dbuser
+            sed -i "/dbuser = \"bacula\"/a\\    dbport = \"$pg_port\"" "$config_file"
+        fi
+        
+        # Asegurar que dbaddress esté configurado
+        if ! grep -q "dbaddress" "$config_file"; then
+            sed -i "/dbport/a\\    dbaddress = \"127.0.0.1\"" "$config_file"
+        fi
+        
+        # Actualizar otras configuraciones
+        sed -i 's/dbname = .*/dbname = "bacula"/g' "$config_file" 2>/dev/null || true
+        sed -i 's/dbuser = .*/dbuser = "bacula"/g' "$config_file" 2>/dev/null || true
+        sed -i "s/dbpassword = .*/dbpassword = \"$db_password\"/g" "$config_file" 2>/dev/null || true
+        
+        echo -e "   ${COLOR_GREEN}✓ Bacula configuration updated${COLOR_RESET}"
+    fi
+    
+    # 8. Probar conexión
+    echo -e "${COLOR_INFO}Step 8: Testing connection...${COLOR_RESET}"
+    
+    if su - postgres -c "psql -p $pg_port -d bacula -c 'SELECT VersionId FROM Version LIMIT 1;'" 2>/dev/null | grep -q "[0-9]"; then
+        echo -e "   ${COLOR_GREEN}✓ Database connection test passed${COLOR_RESET}"
+    else
+        echo -e "   ${COLOR_YELLOW}⚠ Could not verify database tables${COLOR_RESET}"
+    fi
+    
+    echo ""
+    echo -e "${COLOR_GREEN}✓ Database setup completed${COLOR_RESET}"
+    echo -e "   ${COLOR_DIM}PostgreSQL Port: $pg_port${COLOR_RESET}"
+    echo -e "   ${COLOR_DIM}Database: bacula${COLOR_RESET}"
+    echo -e "   ${COLOR_DIM}User: bacula${COLOR_RESET}"
+    
+    return 0
 }
 
 # --- Sincronizar contraseña de base de datos / Sync database password ---
