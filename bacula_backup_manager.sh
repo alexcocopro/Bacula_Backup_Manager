@@ -5812,6 +5812,113 @@ fix_bacula_permissions() {
     chmod 644 /var/log/bacula/bacula.log 2>/dev/null || true
 }
 
+# --- Auto-fix para problemas comunes de Bacula / Auto-fix common Bacula issues ---
+auto_fix_bacula_issues() {
+    local config_file="/etc/bacula/bacula-dir.conf"
+    local fixed=false
+    
+    echo -e "    ${COLOR_CYAN}→ Running auto-fix routines...${COLOR_RESET}"
+    
+    # 1. Verificar e iniciar PostgreSQL si no está corriendo
+    if ! systemctl is-active --quiet postgresql@17-main 2>/dev/null && ! systemctl is-active --quiet postgresql 2>/dev/null; then
+        echo -e "      ${COLOR_YELLOW}⚠ PostgreSQL not running, attempting to start...${COLOR_RESET}"
+        systemctl start postgresql@17-main 2>/dev/null || systemctl start postgresql 2>/dev/null
+        sleep 3
+        if systemctl is-active --quiet postgresql@17-main 2>/dev/null || systemctl is-active --quiet postgresql 2>/dev/null; then
+            echo -e "      ${COLOR_GREEN}✓ PostgreSQL started${COLOR_RESET}"
+            fixed=true
+        else
+            echo -e "      ${COLOR_RED}✗ Failed to start PostgreSQL${COLOR_RESET}"
+        fi
+    fi
+    
+    # 2. Verificar y corregir pg_hba.conf si es necesario
+    local pg_hba_file="/etc/postgresql/17/main/pg_hba.conf"
+    if [[ -f "$pg_hba_file" ]]; then
+        if ! grep -q "bacula" "$pg_hba_file"; then
+            echo -e "      ${COLOR_YELLOW}⚠ Adding bacula auth rules to pg_hba.conf...${COLOR_RESET}"
+            cp "$pg_hba_file" "${pg_hba_file}.backup.$(date +%Y%m%d%H%M%S)"
+            sed -i '1i\
+# Bacula authentication\
+local   bacula          bacula                                  scram-sha-256\
+host    bacula          bacula          127.0.0.1/32            scram-sha-256\
+host    bacula          bacula          ::1/128                 scram-sha-256\
+' "$pg_hba_file"
+            systemctl reload postgresql@17-main 2>/dev/null || systemctl reload postgresql 2>/dev/null
+            echo -e "      ${COLOR_GREEN}✓ pg_hba.conf updated${COLOR_RESET}"
+            fixed=true
+        fi
+    fi
+    
+    # 3. Verificar y crear tablas de Bacula si no existen
+    if ! su - postgres -c "psql -d bacula -c 'SELECT 1 FROM Version LIMIT 1;'" 2>/dev/null | grep -q 1; then
+        echo -e "      ${COLOR_YELLOW}⚠ Bacula tables not found, creating...${COLOR_RESET}"
+        if [[ -f "/usr/share/bacula-director/make_postgresql_tables" ]]; then
+            sed -n '/^CREATE TABLE/,/^END-OF-DATA/p' /usr/share/bacula-director/make_postgresql_tables 2>/dev/null | head -n -1 > /tmp/bacula_fix_tables.sql
+            if [[ -s /tmp/bacula_fix_tables.sql ]]; then
+                su - postgres -c "psql -d bacula -f /tmp/bacula_fix_tables.sql" 2>/dev/null
+                rm -f /tmp/bacula_fix_tables.sql
+                sed -n '/^grant all/,/^END-OF-DATA/p' /usr/share/bacula-director/grant_postgresql_privileges 2>/dev/null | sed 's/\\${db_name}/bacula/g; s/\\${db_user}/bacula/g' > /tmp/bacula_fix_grants.sql
+                su - postgres -c "psql -d bacula -f /tmp/bacula_fix_grants.sql" 2>/dev/null
+                rm -f /tmp/bacula_fix_grants.sql
+                echo -e "      ${COLOR_GREEN}✓ Bacula tables created${COLOR_RESET}"
+                fixed=true
+            fi
+        fi
+    fi
+    
+    # 4. Sincronizar contraseñas
+    local config_password=$(grep -E "^\\s*dbpassword\\s*=" "$config_file" 2>/dev/null | head -1 | sed 's/.*=\\s*"\\([^"]*\\)".*/\\1/')
+    if [[ -n "$config_password" ]]; then
+        echo -e "      ${COLOR_CYAN}→ Syncing database password...${COLOR_RESET}"
+        su - postgres -c "psql -c \"ALTER USER bacula WITH PASSWORD '${config_password}';\"" 2>/dev/null
+        echo -e "      ${COLOR_GREEN}✓ Password synchronized${COLOR_RESET}"
+        fixed=true
+    fi
+    
+    # 5. Corregir errores de sintaxis en FileSets
+    echo -e "      ${COLOR_CYAN}→ Checking FileSet syntax...${COLOR_RESET}"
+    local temp_file=$(mktemp)
+    awk '
+        /^FileSet[[:space:]]*\\{/ { in_fileset=1; in_include=0 }
+        /^Include[[:space:]]*\\{/ { in_include=1 }
+        /^\\}[[:space:]]*$/ { 
+            if (in_include) { 
+                in_include=0 
+            } else if (in_fileset) {
+                in_fileset=0
+            }
+        }
+        /^[[:space:]]*File[[:space:]]*=/ && in_include {
+            getline next_line
+            if (next_line ~ /^\\}[[:space:]]*$/) {
+                print "    }"
+                print "}"
+                in_include=0
+                in_fileset=0
+                next
+            } else {
+                print
+                print next_line
+                next
+            }
+        }
+        { print }
+    ' "$config_file" > "$temp_file" 2>/dev/null
+    if [[ -s "$temp_file" ]]; then
+        mv "$temp_file" "$config_file"
+        fixed=true
+    fi
+    
+    if [[ "$fixed" == true ]]; then
+        echo -e "    ${COLOR_GREEN}✓ Auto-fix completed${COLOR_RESET}"
+        return 0
+    else
+        echo -e "    ${COLOR_YELLOW}⚠ No fixes applied${COLOR_RESET}"
+        return 1
+    fi
+}
+
 # --- Pre-flight check para bacula-dir / Pre-flight check for bacula-dir ---
 preflight_check_bacula_dir() {
     local error_log="/tmp/bacula_dir_error.log"
@@ -5831,6 +5938,18 @@ preflight_check_bacula_dir() {
         rm -f "$error_log"
         return 0
     else
+        # Intentar auto-corrección de errores comunes
+        echo -e "    ${COLOR_YELLOW}⚠ Configuration validation failed. Attempting auto-fix...${COLOR_RESET}"
+        
+        if auto_fix_bacula_issues; then
+            # Reintentar validación después de auto-fix
+            if sudo bacula-dir -t -c "$config_file" > "$error_log" 2>&1; then
+                echo -e "    ${COLOR_GREEN}✓ Configuration fixed and validation passed${COLOR_RESET}"
+                rm -f "$error_log"
+                return 0
+            fi
+        fi
+        
         echo -e "    ${COLOR_RED}╔══════════════════════════════════════════════════════════════════╗${COLOR_RESET}"
         echo -e "    ${COLOR_RED}║  ✗ Error fatal en la configuración de bacula-dir                 ║${COLOR_RESET}"
         echo -e "    ${COLOR_RED}╚══════════════════════════════════════════════════════════════════╝${COLOR_RESET}"
