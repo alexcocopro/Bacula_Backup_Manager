@@ -1526,6 +1526,144 @@ is_bacula_installed() {
     return 1
 }
 
+# --- Utilidades robustas de servicios Bacula / Robust Bacula service utilities ---
+bacula_service_candidates() {
+    case "${1:-}" in
+        director) echo "bacula-dir bacula-director" ;;
+        storage)  echo "bacula-sd bacula-storage" ;;
+        client)   echo "bacula-fd bacula-client bacula-filedaemon" ;;
+    esac
+}
+
+service_unit_exists() {
+    local svc="${1:-}"
+    [[ -n "$svc" ]] || return 1
+
+    systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "^${svc}\.service" || \
+    systemctl status "$svc" >/dev/null 2>&1
+}
+
+find_bacula_service() {
+    local role="${1:-}"
+    local svc
+
+    for svc in $(bacula_service_candidates "$role"); do
+        if service_unit_exists "$svc"; then
+            echo "$svc"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+is_bacula_component_installed() {
+    local role="${1:-}"
+
+    case "$role" in
+        director)
+            command -v bacula-dir >/dev/null 2>&1 || \
+            command -v bacula-director >/dev/null 2>&1 || \
+            command -v bacula-dir-sqlite3 >/dev/null 2>&1 || \
+            command -v bacula-dir-postgresql >/dev/null 2>&1 || \
+            find_bacula_service director >/dev/null 2>&1
+            ;;
+        storage)
+            command -v bacula-sd >/dev/null 2>&1 || \
+            command -v bacula-storage >/dev/null 2>&1 || \
+            find_bacula_service storage >/dev/null 2>&1
+            ;;
+        client)
+            command -v bacula-fd >/dev/null 2>&1 || \
+            command -v bacula-client >/dev/null 2>&1 || \
+            command -v bacula-fd-sqlite3 >/dev/null 2>&1 || \
+            find_bacula_service client >/dev/null 2>&1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+missing_bacula_components() {
+    local missing=()
+
+    is_bacula_component_installed director || missing+=("director")
+    is_bacula_component_installed storage || missing+=("storage/bacula-sd")
+    is_bacula_component_installed client || missing+=("client/file-daemon")
+
+    echo "${missing[*]}"
+}
+
+# Redefine installation check so stale config files do not hide missing packages.
+is_bacula_installed() {
+    is_bacula_component_installed director && \
+    is_bacula_component_installed storage && \
+    is_bacula_component_installed client
+}
+
+start_bacula_services() {
+    local role svc failed=0
+
+    systemctl daemon-reload 2>/dev/null || true
+
+    for role in director storage client; do
+        svc=$(find_bacula_service "$role" 2>/dev/null || true)
+        if [[ -z "$svc" ]]; then
+            echo -e "    ${COLOR_YELLOW}⚠ ${role} service not installed${COLOR_RESET}"
+            ((failed++))
+            continue
+        fi
+
+        systemctl enable "$svc" >/dev/null 2>&1 || true
+
+        if [[ "$role" == "storage" ]]; then
+            preflight_check_bacula_sd || {
+                ((failed++))
+                continue
+            }
+        fi
+
+        if systemctl start "$svc" 2>/dev/null; then
+            echo -e "    ${COLOR_GREEN}✓ $svc started${COLOR_RESET}"
+        else
+            echo -e "    ${COLOR_RED}✗ $svc failed to start${COLOR_RESET}"
+            ((failed++))
+        fi
+    done
+
+    [[ $failed -eq 0 ]]
+}
+
+restart_bacula_services() {
+    local role svc failed=0
+
+    systemctl daemon-reload 2>/dev/null || true
+
+    for role in director storage client; do
+        svc=$(find_bacula_service "$role" 2>/dev/null || true)
+        if [[ -z "$svc" ]]; then
+            echo -e "    ${COLOR_YELLOW}⚠ ${role} service not installed${COLOR_RESET}"
+            ((failed++))
+            continue
+        fi
+
+        if [[ "$role" == "storage" ]]; then
+            preflight_check_bacula_sd || {
+                ((failed++))
+                continue
+            }
+        fi
+
+        if systemctl restart "$svc" 2>/dev/null; then
+            echo -e "    ${COLOR_GREEN}✓ $svc restarted${COLOR_RESET}"
+        else
+            echo -e "    ${COLOR_RED}✗ $svc failed to restart${COLOR_RESET}"
+            ((failed++))
+        fi
+    done
+
+    [[ $failed -eq 0 ]]
+}
+
 # --- Instalar Bacula / Install Bacula ---
 install_bacula() {
     show_banner
@@ -1701,11 +1839,36 @@ install_bacula() {
             ;;
     esac
 
+    if ! is_bacula_installed; then
+        local missing_components
+        missing_components=$(missing_bacula_components)
+        echo -e "${COLOR_RED}✗ Bacula installation is incomplete${COLOR_RESET}"
+        echo -e "  ${COLOR_YELLOW}Missing components: ${missing_components:-unknown}${COLOR_RESET}"
+        echo -e "  ${COLOR_YELLOW}Install the missing Bacula packages and run option 2 again.${COLOR_RESET}"
+        log_message "ERROR" "Bacula installation incomplete. Missing: ${missing_components:-unknown}"
+        read -rp "$(t "press_continue")"
+        return 1
+    fi
+
     
     # Configurar PostgreSQL para Bacula / Configure PostgreSQL for Bacula
     setup_bacula_database &
     spinner $!
     wait $!
+
+    ensure_local_component_configs "/backups" "$(hostname -s)-dir"
+
+    echo -e "${COLOR_CYAN}Starting Bacula services...${COLOR_RESET}"
+    if ! start_bacula_services; then
+        echo -e "  ${COLOR_YELLOW}⚠ Some Bacula services could not be started. Check the messages above.${COLOR_RESET}"
+    fi
+
+    echo ""
+    echo -e "${COLOR_GREEN}✓ $(t "install_success")${COLOR_RESET}"
+    log_message "INFO" "Bacula installation completed"
+
+    sleep 2
+    return 0
     
     # Iniciar servicios / Start services - intentar múltiples nombres
     systemctl daemon-reload 2>/dev/null || true
@@ -2522,6 +2685,19 @@ save_job_config() {
     } > "$CONFIG_DIR/jobs/${job_name}.conf"
     
     chmod 600 "$CONFIG_DIR/jobs/${job_name}.conf"
+
+    # Keep the global manager status in sync with job-based configuration.
+    cat > "$CONFIG_DIR/manager.conf" << EOF
+DIRECTOR_NAME="$(hostname -s)-dir"
+BACKUP_PATH="$backup_path"
+SCHEDULE_TYPE="$schedule_type"
+RETENTION="$retention"
+BACKUP_TYPE="Job"
+LAST_JOB="$job_name"
+CONFIG_DATE="$(date -Iseconds)"
+SCRIPT_VERSION="$SCRIPT_VERSION"
+EOF
+    chmod 600 "$CONFIG_DIR/manager.conf"
 }
 
 # --- Agregar job a configuración Bacula / Add job to Bacula configuration ---
