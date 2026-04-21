@@ -32,12 +32,41 @@ fi
 
 CURRENT_LOG=""
 STOPPED_SERVICES=()
+APP_LANG="${APP_LANG:-es}"
+LANGUAGE_SELECTED="${LANGUAGE_SELECTED:-false}"
 
 info() { echo -e "${C_CYAN}[*]${C_RESET} $*"; log "INFO" "$*"; }
 ok() { echo -e "${C_GREEN}[+]${C_RESET} $*"; log "INFO" "$*"; }
 warn() { echo -e "${C_YELLOW}[!]${C_RESET} $*"; log "WARN" "$*"; }
 fail() { echo -e "${C_RED}[x]${C_RESET} $*" >&2; log "ERROR" "$*"; }
 die() { fail "$*"; exit 1; }
+
+t() {
+    local key="${1:-}"
+    case "$key" in
+        title) [[ "$APP_LANG" == "en" ]] && echo "Secure Backup Manager" || echo "Gestor Seguro de Respaldos" ;;
+        install) [[ "$APP_LANG" == "en" ]] && echo "Install dependencies/global command" || echo "Instalar dependencias/comando global" ;;
+        configure) [[ "$APP_LANG" == "en" ]] && echo "Create or configure backup job" || echo "Crear o configurar respaldo" ;;
+        status) [[ "$APP_LANG" == "en" ]] && echo "Status and verification" || echo "Estado y verificacion" ;;
+        run_full) [[ "$APP_LANG" == "en" ]] && echo "Run full backup now" || echo "Ejecutar respaldo completo ahora" ;;
+        run_inc) [[ "$APP_LANG" == "en" ]] && echo "Run incremental backup now" || echo "Ejecutar respaldo incremental ahora" ;;
+        list) [[ "$APP_LANG" == "en" ]] && echo "List backups" || echo "Listar respaldos" ;;
+        verify) [[ "$APP_LANG" == "en" ]] && echo "Verify backup" || echo "Verificar respaldo" ;;
+        restore) [[ "$APP_LANG" == "en" ]] && echo "Restore backup" || echo "Restaurar respaldo" ;;
+        ssh_key) [[ "$APP_LANG" == "en" ]] && echo "Show SSH public key" || echo "Mostrar llave publica SSH" ;;
+        language) [[ "$APP_LANG" == "en" ]] && echo "Language / Idioma" || echo "Idioma / Language" ;;
+        exit) [[ "$APP_LANG" == "en" ]] && echo "Exit" || echo "Salir" ;;
+        option) [[ "$APP_LANG" == "en" ]] && echo "Option" || echo "Opcion" ;;
+        optional_job) [[ "$APP_LANG" == "en" ]] && echo "JOB_ID optional" || echo "JOB_ID opcional" ;;
+        job_id) [[ "$APP_LANG" == "en" ]] && echo "JOB_ID" || echo "JOB_ID" ;;
+        backup_id) [[ "$APP_LANG" == "en" ]] && echo "BACKUP_ID" || echo "BACKUP_ID" ;;
+        restore_path) [[ "$APP_LANG" == "en" ]] && echo "Restore destination path" || echo "Ruta destino de restauracion" ;;
+        invalid) [[ "$APP_LANG" == "en" ]] && echo "Invalid option" || echo "Opcion invalida" ;;
+        verified) [[ "$APP_LANG" == "en" ]] && echo "VERIFIED" || echo "VERIFICADO" ;;
+        not_verified) [[ "$APP_LANG" == "en" ]] && echo "NOT VERIFIED" || echo "NO VERIFICADO" ;;
+        *) echo "$key" ;;
+    esac
+}
 
 log() {
     local level="${1:-INFO}"
@@ -485,6 +514,7 @@ run_backup() {
 
     info "Verificando integridad local"
     (cd "$backup_dir" && sha256sum -c "$(basename "$hash_file")") >> "$CURRENT_LOG" 2>&1
+    mark_backup_verified "$backup_dir"
 
     sync_remote "$backup_dir" "$archive" "$hash_file" "$manifest"
     prune_old_backups
@@ -506,7 +536,12 @@ list_backups() {
     local job_id="${1:-}"
     if [[ -n "$job_id" ]]; then
         load_job "$job_id"
-        find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
+        local backup_dir backup_id status
+        while IFS= read -r backup_dir; do
+            backup_id="$(basename "$backup_dir")"
+            status="$(backup_verification_status "$backup_dir")"
+            printf '%-28s %s\n' "$backup_id" "$status"
+        done < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20*' 2>/dev/null | sort)
     else
         local job
         while IFS= read -r job; do
@@ -531,6 +566,8 @@ verify_backup() {
     [[ -f "$hash_file" ]] || die "No existe hash SHA256 en $backup_dir"
 
     (cd "$backup_dir" && sha256sum -c "$(basename "$hash_file")")
+    mark_backup_verified "$backup_dir"
+    ok "$(t verified): $backup_id"
 }
 
 restore_backup() {
@@ -705,17 +742,134 @@ prompt_yes_no() {
     [[ "$value" =~ ^[sSyY] ]]
 }
 
+choose_language() {
+    local value
+    echo "1) Español"
+    echo "2) English"
+    read -r -p "Idioma / Language [1]: " value
+    case "${value:-1}" in
+        2) APP_LANG="en" ;;
+        *) APP_LANG="es" ;;
+    esac
+    LANGUAGE_SELECTED="true"
+}
+
+prompt_choice() {
+    local text="$1"
+    local min="$2"
+    local max="$3"
+    local default="${4:-1}"
+    local value
+
+    while true; do
+        read -r -p "$text [$default]: " value
+        value="${value:-$default}"
+        if [[ "$value" =~ ^[0-9]+$ && "$value" -ge "$min" && "$value" -le "$max" ]]; then
+            echo "$value"
+            return 0
+        fi
+        echo -e "${C_YELLOW}[!]${C_RESET} $(t invalid)" >&2
+    done
+}
+
+prompt_time() {
+    local text="$1"
+    local default="${2:-02:00}"
+    local value
+
+    while true; do
+        value="$(prompt "$text" "$default")"
+        if [[ "$value" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+            printf '%s:00\n' "$value"
+            return 0
+        fi
+        echo -e "${C_YELLOW}[!]${C_RESET} Formato invalido. Use HH:MM / Invalid format. Use HH:MM" >&2
+    done
+}
+
+prompt_schedule() {
+    local label="$1"
+    local default_time="$2"
+    local freq day time
+
+    echo "" >&2
+    echo -e "${C_BOLD}${label}${C_RESET}" >&2
+    echo "1) Diario / Daily" >&2
+    echo "2) Semanal / Weekly" >&2
+    echo "3) Mensual / Monthly" >&2
+    freq="$(prompt_choice "Frecuencia / Frequency" 1 3 1)"
+
+    case "$freq" in
+        1)
+            time="$(prompt_time "Hora / Time" "$default_time")"
+            echo "*-*-* $time"
+            ;;
+        2)
+            echo "1) Lunes/Monday  2) Martes/Tuesday  3) Miercoles/Wednesday" >&2
+            echo "4) Jueves/Thursday  5) Viernes/Friday  6) Sabado/Saturday  7) Domingo/Sunday" >&2
+            day="$(prompt_choice "Dia / Day" 1 7 7)"
+            time="$(prompt_time "Hora / Time" "$default_time")"
+            case "$day" in
+                1) echo "Mon *-*-* $time" ;;
+                2) echo "Tue *-*-* $time" ;;
+                3) echo "Wed *-*-* $time" ;;
+                4) echo "Thu *-*-* $time" ;;
+                5) echo "Fri *-*-* $time" ;;
+                6) echo "Sat *-*-* $time" ;;
+                7) echo "Sun *-*-* $time" ;;
+            esac
+            ;;
+        3)
+            day="$(prompt_choice "Dia del mes / Day of month" 1 28 1)"
+            time="$(prompt_time "Hora / Time" "$default_time")"
+            printf '*-*-%02d %s\n' "$day" "$time"
+            ;;
+    esac
+}
+
+backup_verification_status() {
+    local backup_dir="$1"
+    [[ -f "${backup_dir}/.verified" ]] && { t verified; return 0; }
+    t not_verified
+}
+
+mark_backup_verified() {
+    local backup_dir="$1"
+    {
+        echo "VERIFIED_AT=$(date -Is)"
+        echo "HOSTNAME=$(hostname -f 2>/dev/null || hostname)"
+    } > "${backup_dir}/.verified"
+}
+
+verification_summary() {
+    local root="$1"
+    local total=0 verified=0 not_verified=0 dir
+
+    while IFS= read -r dir; do
+        ((++total))
+        if [[ -f "${dir}/.verified" ]]; then
+            ((++verified))
+        else
+            ((++not_verified))
+        fi
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -name '20*' 2>/dev/null)
+
+    printf '%s: %s | %s: %s | %s: %s\n' \
+        "Total" "$total" "$(t verified)" "$verified" "$(t not_verified)" "$not_verified"
+}
+
 configure_job() {
     require_root
     ensure_base_dirs
+    [[ "$LANGUAGE_SELECTED" == "true" ]] || choose_language
 
-    echo -e "${C_BOLD}${C_BLUE}Secure Backup Manager - Nuevo job${C_RESET}"
+    echo -e "${C_BOLD}${C_BLUE}$(t title)${C_RESET}"
 
     local name job_id backup_root retention full_cal inc_cal db_type db_mode remote_enabled remote_dest ssh_port email
-    name="$(prompt "Nombre del job" "backup-principal")"
+    name="$(prompt "Nombre del job / Job name" "backup-principal")"
     job_id="$(safe_job_id "$name")"
-    backup_root="$(prompt "Ruta local para guardar respaldos" "${DEFAULT_BACKUP_ROOT}/${job_id}")"
-    retention="$(prompt "Retencion local en dias" "30")"
+    backup_root="$(prompt "Ruta local / Local backup path" "${DEFAULT_BACKUP_ROOT}/${job_id}")"
+    retention="$(prompt "Retencion local en dias / Local retention days" "30")"
 
     local dirs_file="${JOBS_DIR}/${job_id}.dirs"
     local excludes_file="${JOBS_DIR}/${job_id}.excludes"
@@ -723,58 +877,71 @@ configure_job() {
     local dbs_file="${JOBS_DIR}/${job_id}.dbs"
     : > "$dirs_file"; : > "$excludes_file"; : > "$services_file"; : > "$dbs_file"
 
-    echo "Ingrese directorios a respaldar. Deje vacio para terminar."
+    echo "Directorios a respaldar / Directories to back up. Enter vacio para terminar / Empty to finish."
     local path
     while true; do
-        path="$(prompt "Directorio")"
+        path="$(prompt "Directorio / Directory")"
         [[ -z "$path" ]] && break
         echo "$path" >> "$dirs_file"
     done
 
-    echo "Ingrese patrones a excluir (opcional). Ej: *.tmp, cache, node_modules"
-    while true; do
-        path="$(prompt "Excluir")"
-        [[ -z "$path" ]] && break
-        echo "$path" >> "$excludes_file"
-    done
-
-    db_type="none"
-    if prompt_yes_no "Desea respaldar base de datos? (s/n)" "n"; then
-        db_type="$(prompt "Tipo DB: postgres/mysql" "postgres")"
-        db_mode="$(prompt "Modo DB: logical para dump en caliente, cold para archivos con servicios detenidos" "logical")"
-        if [[ "$db_mode" == "logical" && "$db_type" =~ ^postgres ]]; then
-            echo "DB PostgreSQL especificas para pg_dump -Fc. Deje vacio para pg_dumpall."
-            while true; do
-                path="$(prompt "Base de datos")"
-                [[ -z "$path" ]] && break
-                echo "$path" >> "$dbs_file"
-            done
-        fi
-    else
-        db_mode="logical"
+    if prompt_yes_no "Agregar exclusiones? / Add excludes? (s/n, y/n)" "n"; then
+        echo "Patrones a excluir / Exclude patterns. Ej: *.tmp, cache, node_modules"
+        while true; do
+            path="$(prompt "Excluir / Exclude")"
+            [[ -z "$path" ]] && break
+            echo "$path" >> "$excludes_file"
+        done
     fi
 
-    echo "Servicios a detener durante el respaldo de archivos (opcional). Ej: postgresql, mysql, apache2"
-    echo "Use esto para respaldos cold o sistemas que requieren consistencia por detencion."
-    while true; do
-        path="$(prompt "Servicio")"
-        [[ -z "$path" ]] && break
-        echo "$path" >> "$services_file"
-    done
+    db_type="none"
+    db_mode="logical"
+    if prompt_yes_no "Respaldar base de datos? / Back up database? (s/n, y/n)" "n"; then
+        echo "1) PostgreSQL"
+        echo "2) MySQL/MariaDB"
+        case "$(prompt_choice "Tipo DB / DB type" 1 2 1)" in
+            1) db_type="postgres" ;;
+            2) db_type="mysql" ;;
+        esac
+        echo "1) Logico: dump en caliente / Logical: online dump"
+        echo "2) Frio: detener servicios y respaldar archivos / Cold: stop services and back up files"
+        case "$(prompt_choice "Modo / Mode" 1 2 1)" in
+            1) db_mode="logical" ;;
+            2) db_mode="cold" ;;
+        esac
+        if [[ "$db_mode" == "logical" && "$db_type" =~ ^postgres ]]; then
+            if prompt_yes_no "Elegir bases especificas? Si no, se usa pg_dumpall. / Select specific DBs? Otherwise pg_dumpall. (s/n, y/n)" "n"; then
+                while true; do
+                    path="$(prompt "Base de datos / Database")"
+                    [[ -z "$path" ]] && break
+                    echo "$path" >> "$dbs_file"
+                done
+            fi
+        fi
+    fi
 
-    full_cal="$(prompt "Calendario FULL systemd" "Sun *-*-* 02:00:00")"
-    inc_cal="$(prompt "Calendario INCREMENTAL systemd" "Mon..Sat *-*-* 02:00:00")"
+    if [[ "$db_mode" == "cold" ]] || prompt_yes_no "Detener servicios durante el respaldo? / Stop services during backup? (s/n, y/n)" "n"; then
+        echo "Servicios a detener / Services to stop. Ej: postgresql, mysql, apache2"
+        while true; do
+            path="$(prompt "Servicio / Service")"
+            [[ -z "$path" ]] && break
+            echo "$path" >> "$services_file"
+        done
+    fi
+
+    inc_cal="$(prompt_schedule "Respaldo incremental / Incremental backup" "02:00")"
+    full_cal="$(prompt_schedule "Respaldo completo / Full backup" "03:00")"
 
     remote_enabled="false"
     remote_dest=""
     ssh_port="22"
-    if prompt_yes_no "Enviar respaldo a equipo remoto por SSH key? (s/n)" "n"; then
+    if prompt_yes_no "Enviar a equipo remoto por llave SSH? / Send to remote host with SSH key? (s/n, y/n)" "n"; then
         remote_enabled="true"
-        remote_dest="$(prompt "Destino remoto user@host:/ruta")"
-        ssh_port="$(prompt "Puerto SSH" "22")"
+        remote_dest="$(prompt "Destino remoto / Remote destination user@host:/path")"
+        ssh_port="$(prompt "Puerto SSH / SSH port" "22")"
     fi
 
-    email="$(prompt "Email para notificaciones (opcional)")"
+    email="$(prompt "Email para notificaciones / Notification email (opcional/optional)")"
 
     local job_file="${JOBS_DIR}/${job_id}.conf"
     : > "$job_file"
@@ -801,7 +968,7 @@ configure_job() {
     mkdir -p "$backup_root"
     chmod 750 "$backup_root"
 
-    ok "Job creado: $job_id"
+    ok "Job creado / Job created: $job_id"
 
     if [[ "$remote_enabled" == "true" ]]; then
         generate_ssh_key "$job_id"
@@ -815,7 +982,7 @@ show_status() {
     local job_id="${1:-}"
 
     if [[ -z "$job_id" ]]; then
-        echo "Jobs configurados:"
+        echo "Jobs configurados / Configured jobs:"
         list_jobs || true
         echo ""
         systemctl list-timers "${APP_NAME}-*.timer" --no-pager 2>/dev/null || true
@@ -824,47 +991,51 @@ show_status() {
 
     load_job "$job_id"
     echo "Job: $JOB_ID"
-    echo "Nombre: $JOB_NAME"
+    echo "Nombre / Name: $JOB_NAME"
     echo "Local: $BACKUP_ROOT"
     echo "DB: $DB_TYPE ($DB_MODE)"
-    echo "Remoto: $REMOTE_ENABLED ${REMOTE_DEST:-}"
+    echo "Remoto / Remote: $REMOTE_ENABLED ${REMOTE_DEST:-}"
     echo "Email: ${EMAIL_TO:-no configurado}"
-    echo "Full: $FULL_CALENDAR"
+    echo "Completo / Full: $FULL_CALENDAR"
     echo "Incremental: $INCREMENTAL_CALENDAR"
+    echo "Verificacion / Verification: $(verification_summary "$BACKUP_ROOT")"
     echo ""
     systemctl status "${APP_NAME}-${JOB_ID}-full.timer" "${APP_NAME}-${JOB_ID}-incremental.timer" --no-pager 2>/dev/null || true
     echo ""
-    echo "Ultimos respaldos:"
+    echo "Ultimos respaldos / Recent backups:"
     list_backups "$JOB_ID" | tail -20 || true
 }
 
 menu() {
+    [[ "$LANGUAGE_SELECTED" == "true" ]] || choose_language
     while true; do
         echo ""
-        echo -e "${C_BOLD}${APP_NAME}${C_RESET}"
-        echo "1) Instalar dependencias y comando global"
-        echo "2) Crear/configurar job"
-        echo "3) Estado"
-        echo "4) Ejecutar full ahora"
-        echo "5) Ejecutar incremental ahora"
-        echo "6) Listar respaldos"
-        echo "7) Verificar respaldo"
-        echo "8) Restaurar respaldo"
-        echo "9) Mostrar llave SSH publica"
-        echo "0) Salir"
-        read -r -p "Opcion: " opt
+        echo -e "${C_BOLD}$(t title)${C_RESET}"
+        echo "1) $(t install)"
+        echo "2) $(t configure)"
+        echo "3) $(t status)"
+        echo "4) $(t run_full)"
+        echo "5) $(t run_inc)"
+        echo "6) $(t list)"
+        echo "7) $(t verify)"
+        echo "8) $(t restore)"
+        echo "9) $(t ssh_key)"
+        echo "10) $(t language)"
+        echo "0) $(t exit)"
+        read -r -p "$(t option): " opt
         case "$opt" in
             1) install_self ;;
             2) configure_job ;;
-            3) show_status "$(prompt "JOB_ID opcional")" ;;
-            4) run_backup "$(prompt "JOB_ID")" full ;;
-            5) run_backup "$(prompt "JOB_ID")" incremental ;;
-            6) list_backups "$(prompt "JOB_ID opcional")" ;;
-            7) verify_backup "$(prompt "JOB_ID")" "$(prompt "BACKUP_ID")" ;;
-            8) restore_backup "$(prompt "JOB_ID")" "$(prompt "BACKUP_ID")" "$(prompt "Ruta destino")" ;;
-            9) generate_ssh_key "$(prompt "JOB_ID")" ;;
+            3) show_status "$(prompt "$(t optional_job)")" ;;
+            4) run_backup "$(prompt "$(t job_id)")" full ;;
+            5) run_backup "$(prompt "$(t job_id)")" incremental ;;
+            6) list_backups "$(prompt "$(t optional_job)")" ;;
+            7) verify_backup "$(prompt "$(t job_id)")" "$(prompt "$(t backup_id)")" ;;
+            8) restore_backup "$(prompt "$(t job_id)")" "$(prompt "$(t backup_id)")" "$(prompt "$(t restore_path)")" ;;
+            9) generate_ssh_key "$(prompt "$(t job_id)")" ;;
+            10) choose_language ;;
             0) exit 0 ;;
-            *) warn "Opcion invalida" ;;
+            *) warn "$(t invalid)" ;;
         esac
     done
 }
