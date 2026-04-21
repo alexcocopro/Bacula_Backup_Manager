@@ -46,6 +46,38 @@ warn() { echo -e "${C_YELLOW}[!]${C_RESET} $*"; log "WARN" "$*"; }
 fail() { echo -e "${C_RED}[x]${C_RESET} $*" >&2; log "ERROR" "$*"; }
 die() { fail "$*"; exit 1; }
 
+read_input() {
+    local prompt_text="$1"
+    local default="${2:-}"
+    local value
+
+    if [[ -t 0 && -n "${BASH_VERSION:-}" ]]; then
+        if [[ -n "$default" ]]; then
+            read -r -e -i "$default" -p "$prompt_text" value
+        else
+            read -r -e -p "$prompt_text" value
+        fi
+    else
+        read -r -p "$prompt_text" value
+        [[ -z "$value" && -n "$default" ]] && value="$default"
+    fi
+
+    echo "$value"
+}
+
+show_banner() {
+    clear 2>/dev/null || true
+    cat <<EOF
+${C_CYAN}${C_BOLD}
++============================================================+
+|                    Secure Backup Manager                   |
++============================================================+${C_RESET}
+${C_BOLD}Developed by Alex Cabello Leiva${C_RESET}
+Innovation and Cybersecurity Consultant
+EOF
+    echo ""
+}
+
 t() {
     local key="${1:-}"
     case "$key" in
@@ -891,10 +923,10 @@ prompt() {
     local default="${2:-}"
     local value
     if [[ -n "$default" ]]; then
-        read -r -p "$text [$default]: " value
+        value="$(read_input "$text: " "$default")"
         echo "${value:-$default}"
     else
-        read -r -p "$text: " value
+        value="$(read_input "$text: ")"
         echo "$value"
     fi
 }
@@ -903,7 +935,7 @@ prompt_yes_no() {
     local text="$1"
     local default="${2:-n}"
     local value
-    read -r -p "$text [$default]: " value
+    value="$(read_input "$text: " "$default")"
     value="${value:-$default}"
     [[ "$value" =~ ^[sSyY] ]]
 }
@@ -912,7 +944,7 @@ choose_language() {
     local value
     echo "1) Español"
     echo "2) English"
-    read -r -p "Idioma / Language [1]: " value
+    value="$(read_input "Idioma / Language: " "1")"
     case "${value:-1}" in
         2) APP_LANG="en" ;;
         *) APP_LANG="es" ;;
@@ -928,7 +960,7 @@ prompt_choice() {
     local value
 
     while true; do
-        read -r -p "$text [$default]: " value
+        value="$(read_input "$text: " "$default")"
         value="${value:-$default}"
         if [[ "$value" =~ ^[0-9]+$ && "$value" -ge "$min" && "$value" -le "$max" ]]; then
             echo "$value"
@@ -1263,9 +1295,10 @@ show_status() {
 }
 
 menu() {
+    show_banner
     [[ "$LANGUAGE_SELECTED" == "true" ]] || choose_language
     while true; do
-        echo ""
+        show_banner
         echo -e "${C_BOLD}$(t title)${C_RESET}"
         echo "1) $(t install)"
         echo "2) $(t configure)"
@@ -1279,7 +1312,7 @@ menu() {
         echo "10) $(t delete_job)"
         echo "11) $(t language)"
         echo "0) $(t exit)"
-        read -r -p "$(t option): " opt
+        opt="$(read_input "$(t option): ")"
         case "$opt" in
             1) install_self ;;
             2) configure_job ;;
