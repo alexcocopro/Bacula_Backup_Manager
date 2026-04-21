@@ -1632,7 +1632,7 @@ install_bacula() {
             local pg_version
             pg_version=$(detect_postgresql_version)
 
-            local bacula_pkgs=(bacula-director bacula-sd bacula-fd bacula-console)
+            local bacula_pkgs=(bacula-director bacula-director-pgsql bacula-sd bacula-fd bacula-console dbconfig-pgsql)
 
             if [[ "$pg_version" != "not_installed" ]]; then
                 echo -e "   ${COLOR_YELLOW}⚠ $(t "postgresql_existing") $pg_version${COLOR_RESET}"
@@ -1644,7 +1644,12 @@ install_bacula() {
 
             (
                 export DEBIAN_FRONTEND=noninteractive
-                apt_install_with_retry "${bacula_pkgs[@]}"
+                apt_install_with_retry "${bacula_pkgs[@]}" || {
+                    echo -e "   ${COLOR_YELLOW}⚠ PostgreSQL Bacula package variant not available, trying generic packages...${COLOR_RESET}"
+                    local fallback_pkgs=(bacula-director bacula-sd bacula-fd bacula-console)
+                    [[ "$pg_version" == "not_installed" ]] && fallback_pkgs+=(postgresql postgresql-contrib)
+                    apt_install_with_retry "${fallback_pkgs[@]}"
+                }
             ) &
             spinner $!
             wait $! || {
@@ -1847,13 +1852,14 @@ host    bacula          bacula          ::1/128                 scram-sha-256\
             
             # Ejecutar el script de creación de tablas
             if [[ -f "$sql_scripts_dir/make_postgresql_tables" ]]; then
-                cd "$sql_scripts_dir"
-                # El script intenta conectar como postgres, necesitamos modificarlo o ejecutar SQL directamente
-                # Extraer y ejecutar SQL directamente
-                sed -n '/^BEGIN;/,/^END-OF-DATA/p' "$sql_scripts_dir/make_postgresql_tables" | head -n -1 > /tmp/bacula_tables.sql
-                if [[ -f /tmp/bacula_tables.sql ]]; then
-                    su - postgres -c "psql -p $pg_port -d bacula -f /tmp/bacula_tables.sql" 2>/dev/null
-                    rm -f /tmp/bacula_tables.sql
+                if su - postgres -c "cd '$sql_scripts_dir' && db_name=bacula db_user=bacula ./make_postgresql_tables -p $pg_port" 2>/dev/null; then
+                    :
+                else
+                    sed -n '/^BEGIN;/,/^END-OF-DATA/p' "$sql_scripts_dir/make_postgresql_tables" | head -n -1 > /tmp/bacula_tables.sql
+                    if [[ -s /tmp/bacula_tables.sql ]]; then
+                        su - postgres -c "psql -p $pg_port -d bacula -f /tmp/bacula_tables.sql" 2>/dev/null || true
+                        rm -f /tmp/bacula_tables.sql
+                    fi
                 fi
             fi
             
@@ -2044,7 +2050,17 @@ fix_duplicate_clients() {
     echo -e "${COLOR_CYAN}Checking for duplicate Client resources...${COLOR_RESET}"
     
     # Extraer todos los nombres de Client y contar ocurrencias
-    local client_names=$(grep -E "^\s*Name\s*=" "$config_file" | grep -A1 "Client {" | grep "Name" | sed 's/.*=\s*"\([^"]*\)".*/\1/' | sort)
+    local client_names
+    client_names=$(awk '
+        /^[[:space:]]*Client[[:space:]]*\{/ { in_client=1; next }
+        in_client && /^[[:space:]]*Name[[:space:]]*=/ {
+            name=$0
+            sub(/^[^=]*=[[:space:]]*/, "", name)
+            gsub(/["[:space:]]/, "", name)
+            print name
+        }
+        in_client && /^[[:space:]]*\}/ { in_client=0 }
+    ' "$config_file" | sort)
     local duplicates=$(echo "$client_names" | uniq -d)
     
     if [[ -z "$duplicates" ]]; then
@@ -2070,13 +2086,17 @@ fix_duplicate_clients() {
     local skip_block=false
     
     while IFS= read -r line; do
-        if [[ "$line" =~ ^Client[[:space:]]*\{ ]]; then
+        local client_start_re='^[[:space:]]*Client[[:space:]]*\{'
+        local name_re='^[[:space:]]*Name[[:space:]]*=[[:space:]]*"?([^"]+)"?'
+        local block_end_re='^[[:space:]]*\}'
+        if [[ "$line" =~ $client_start_re ]]; then
             in_client=true
             client_name=""
             skip_block=false
             echo "$line" >> "$temp_file"
-        elif [[ "$in_client" == true && "$line" =~ ^\s*Name[[:space:]]*="([^\"]+)" ]]; then
+        elif [[ "$in_client" == true && "$line" =~ $name_re ]]; then
             client_name="${BASH_REMATCH[1]}"
+            client_name="${client_name%%[[:space:]]*}"
             if echo "$seen_clients" | grep -q "^${client_name}$"; then
                 # Duplicado encontrado, eliminar este bloque
                 skip_block=true
@@ -2089,7 +2109,7 @@ fix_duplicate_clients() {
 "
                 echo "$line" >> "$temp_file"
             fi
-        elif [[ "$line" =~ ^\} && "$in_client" == true ]]; then
+        elif [[ "$line" =~ $block_end_re && "$in_client" == true ]]; then
             in_client=false
             if [[ "$skip_block" == false ]]; then
                 echo "$line" >> "$temp_file"
@@ -2116,6 +2136,190 @@ fix_duplicate_clients() {
     return 0
 }
 
+# --- Utilidades de configuración Bacula / Bacula config utilities ---
+bacula_resource_exists() {
+    local resource="${1:-}"
+    local name="${2:-}"
+    local config_file="${3:-/etc/bacula/bacula-dir.conf}"
+
+    [[ -f "$config_file" && -n "$resource" && -n "$name" ]] || return 1
+
+    awk -v resource="$resource" -v wanted="$name" '
+        $0 ~ "^[[:space:]]*" resource "[[:space:]]*\\{" { in_resource=1; found=0; next }
+        in_resource && /^[[:space:]]*Name[[:space:]]*=/ {
+            value=$0
+            sub(/^[^=]*=[[:space:]]*/, "", value)
+            gsub(/"/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            if (value == wanted) found=1
+        }
+        in_resource && /^[[:space:]]*\}/ {
+            if (found) exit 0
+            in_resource=0
+        }
+        END { exit found ? 0 : 1 }
+    ' "$config_file"
+}
+
+get_bacula_resource_password() {
+    local resource="${1:-}"
+    local name="${2:-}"
+    local config_file="${3:-/etc/bacula/bacula-dir.conf}"
+
+    [[ -f "$config_file" && -n "$resource" ]] || return 1
+
+    awk -v resource="$resource" -v wanted="$name" '
+        $0 ~ "^[[:space:]]*" resource "[[:space:]]*\\{" { in_resource=1; found=(wanted == ""); next }
+        in_resource && /^[[:space:]]*Name[[:space:]]*=/ {
+            value=$0
+            sub(/^[^=]*=[[:space:]]*/, "", value)
+            gsub(/"/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            if (value == wanted) found=1
+        }
+        in_resource && found && /^[[:space:]]*Password[[:space:]]*=/ {
+            value=$0
+            sub(/^[^=]*=[[:space:]]*/, "", value)
+            gsub(/"/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            print value
+            exit 0
+        }
+        in_resource && /^[[:space:]]*\}/ { in_resource=0; found=0 }
+    ' "$config_file"
+}
+
+get_bacula_db_password() {
+    if [[ -f "$CONFIG_DIR/db_credentials.conf" ]]; then
+        grep "^DB_PASSWORD=" "$CONFIG_DIR/db_credentials.conf" 2>/dev/null | head -1 | cut -d= -f2-
+        return 0
+    fi
+
+    grep -E "^[[:space:]]*dbpassword[[:space:]]*=" /etc/bacula/bacula-dir.conf 2>/dev/null | \
+        head -1 | sed 's/.*=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}.*/\1/' || true
+}
+
+ensure_bacula_runtime_dirs() {
+    local backup_path="${1:-/backups}"
+
+    mkdir -p /etc/bacula /etc/bacula/scripts /var/lib/bacula /var/log/bacula /run/bacula /var/run/bacula "$backup_path"
+    touch /var/log/bacula/bacula.log 2>/dev/null || true
+
+    if getent group bacula >/dev/null 2>&1; then
+        chown -R root:bacula /etc/bacula 2>/dev/null || true
+        chown -R bacula:bacula /var/lib/bacula /var/log/bacula /run/bacula /var/run/bacula 2>/dev/null || true
+        chown root:bacula "$backup_path" 2>/dev/null || true
+    fi
+
+    chmod 755 /etc/bacula /etc/bacula/scripts /var/lib/bacula /var/log/bacula /run/bacula /var/run/bacula 2>/dev/null || true
+    chmod 750 "$backup_path" 2>/dev/null || true
+}
+
+ensure_local_component_configs() {
+    local backup_path="${1:-/backups}"
+    local config_file="/etc/bacula/bacula-dir.conf"
+    local director_name="${2:-$(hostname -s)-dir}"
+    local client_name="$(hostname -s)-fd"
+    local storage_name="File1"
+    local sd_name="$(hostname -s)-sd"
+    local director_password
+    local client_password
+    local storage_password
+
+    ensure_bacula_runtime_dirs "$backup_path"
+
+    director_password=$(get_bacula_resource_password "Director" "$director_name" "$config_file")
+    [[ -z "$director_password" ]] && director_password=$(get_bacula_resource_password "Director" "" "$config_file")
+    [[ -z "$director_password" ]] && director_password=$(generate_password)
+
+    client_password=$(get_bacula_resource_password "Client" "$client_name" "$config_file")
+    [[ -z "$client_password" ]] && client_password="$director_password"
+
+    storage_password=$(get_bacula_resource_password "Storage" "$storage_name" "$config_file")
+    [[ -z "$storage_password" ]] && storage_password="$director_password"
+
+    if [[ ! -f /etc/bacula/bacula-sd.conf ]]; then
+        cat > /etc/bacula/bacula-sd.conf << EOF
+# Bacula Storage Daemon Configuration
+# Generated by Bacula Manager v${SCRIPT_VERSION}
+
+Storage {
+    Name = ${sd_name}
+    SDPort = 9103
+    WorkingDirectory = "/var/lib/bacula"
+    PidDirectory = "/run/bacula"
+    Maximum Concurrent Jobs = 20
+    SDAddress = 127.0.0.1
+}
+
+Director {
+    Name = ${director_name}
+    Password = "${storage_password}"
+}
+
+Device {
+    Name = FileStorage
+    Media Type = File
+    Archive Device = "${backup_path}"
+    LabelMedia = yes
+    Random Access = yes
+    AutomaticMount = yes
+    RemovableMedia = no
+    AlwaysOpen = no
+    Maximum Concurrent Jobs = 5
+}
+
+Messages {
+    Name = Standard
+    director = ${director_name} = all
+}
+EOF
+    fi
+
+    if [[ ! -f /etc/bacula/bacula-fd.conf ]]; then
+        cat > /etc/bacula/bacula-fd.conf << EOF
+# Bacula File Daemon Configuration
+# Generated by Bacula Manager v${SCRIPT_VERSION}
+
+Director {
+    Name = ${director_name}
+    Password = "${client_password}"
+}
+
+FileDaemon {
+    Name = ${client_name}
+    FDport = 9102
+    WorkingDirectory = "/var/lib/bacula"
+    PidDirectory = "/run/bacula"
+    Maximum Concurrent Jobs = 20
+    FDAddress = 127.0.0.1
+}
+
+Messages {
+    Name = Standard
+    director = ${director_name} = all, !skipped, !restored
+}
+EOF
+    fi
+
+    if [[ ! -f /etc/bacula/bconsole.conf ]]; then
+        cat > /etc/bacula/bconsole.conf << EOF
+# Bacula Console Configuration
+# Generated by Bacula Manager v${SCRIPT_VERSION}
+
+Director {
+    Name = ${director_name}
+    DIRport = 9101
+    address = 127.0.0.1
+    Password = "${director_password}"
+}
+EOF
+    fi
+
+    chown root:bacula /etc/bacula/*.conf 2>/dev/null || true
+    chmod 640 /etc/bacula/*.conf 2>/dev/null || true
+}
+
 # --- Crear nuevo Job de respaldo / Create new backup job ---
 create_backup_job() {
     local job_name="${1:-}"
@@ -2123,7 +2327,7 @@ create_backup_job() {
     local backup_path="${3:-}"
     local schedule_type="${4:-}"
     local retention="${5:-}"
-    local include_paths=(${@:6})
+    local include_paths=("${@:6}")
     
     echo -e "${COLOR_BOLD}${COLOR_GREEN}═══════════════════════════════════════════════════════════════════════════${COLOR_RESET}"
     echo -e "${COLOR_BOLD}  CREATE NEW BACKUP JOB / CREAR NUEVO JOB DE RESPALDO${COLOR_RESET}"
@@ -2297,6 +2501,7 @@ save_job_config() {
     local storage_target="${8:-local}"
     shift 8
     local include_paths=("$@")
+    ensure_bacula_runtime_dirs "$backup_path"
     
     # Crear directorio de configuración de jobs si no existe
     mkdir -p "$CONFIG_DIR/jobs"
@@ -2333,6 +2538,9 @@ add_job_to_bacula_config() {
     local include_paths=("$@")
     
     local config_file="/etc/bacula/bacula-dir.conf"
+    local director_name="$(hostname -s)-dir"
+    local client_name="$(hostname -s)-fd"
+    local storage_name="File1"
     
     # LIMPIEZA AUTOMÁTICA DE DUPLICADOS / Automatic duplicate cleanup
     echo -e "${COLOR_INFO}Checking for duplicate resources...${COLOR_RESET}"
@@ -2341,8 +2549,8 @@ add_job_to_bacula_config() {
     local client_names=$(grep -E "^\s*Name\s*=" "$config_file" 2>/dev/null | grep -B1 "Client {" | grep "Name" | sed 's/.*=\s*"\([^"]*\)".*/\1/' | sort | uniq -d)
     
     # Eliminar Client duplicados (mantener solo el primero)
-    for client_name in $client_names; do
-        if [[ -n "$client_name" ]]; then
+    for duplicate_client in $client_names; do
+        if [[ -n "$duplicate_client" ]]; then
             echo -e "   ${COLOR_YELLOW}⚠ Removing duplicate Client: $client_name${COLOR_RESET}"
             # Encontrar y eliminar duplicados (mantener el primero)
             local first=true
@@ -2351,14 +2559,18 @@ add_job_to_bacula_config() {
             local skip_block=false
             local current_client=""
             
+            local client_start_re='^[[:space:]]*Client[[:space:]]*\{'
+            local name_re='^[[:space:]]*Name[[:space:]]*=[[:space:]]*"?([^"]+)"?'
+            local block_end_re='^[[:space:]]*\}[[:space:]]*$'
             while IFS= read -r line; do
-                if [[ "$line" =~ ^Client[[:space:]]*\{ ]]; then
+                if [[ "$line" =~ $client_start_re ]]; then
                     in_client=true
                     current_client=""
                     skip_block=false
-                elif [[ "$in_client" == true && "$line" =~ ^\s*Name[[:space:]]*="([^\"]+)" ]]; then
+                elif [[ "$in_client" == true && "$line" =~ $name_re ]]; then
                     current_client="${BASH_REMATCH[1]}"
-                    if [[ "$current_client" == "$client_name" ]]; then
+                    current_client="${current_client%%[[:space:]]*}"
+                    if [[ "$current_client" == "$duplicate_client" ]]; then
                         if [[ "$first" == true ]]; then
                             first=false
                         else
@@ -2366,7 +2578,7 @@ add_job_to_bacula_config() {
                             in_client=false
                         fi
                     fi
-                elif [[ "$line" =~ ^\}[[:space:]]*$ && "$in_client" == true ]]; then
+                elif [[ "$line" =~ $block_end_re && "$in_client" == true ]]; then
                     in_client=false
                     if [[ "$skip_block" == true ]]; then
                         skip_block=false
@@ -2387,8 +2599,8 @@ add_job_to_bacula_config() {
     local storage_names=$(grep -E "^\s*Name\s*=" "$config_file" 2>/dev/null | grep -B1 "Storage {" | grep "Name" | sed 's/.*=\s*"\([^"]*\)".*/\1/' | sort | uniq -d)
     
     # Eliminar Storage duplicados (mantener solo el primero)
-    for storage_name in $storage_names; do
-        if [[ -n "$storage_name" ]]; then
+    for duplicate_storage in $storage_names; do
+        if [[ -n "$duplicate_storage" ]]; then
             echo -e "   ${COLOR_YELLOW}⚠ Removing duplicate Storage: $storage_name${COLOR_RESET}"
             # Encontrar y eliminar duplicados (mantener el primero)
             local first=true
@@ -2397,14 +2609,18 @@ add_job_to_bacula_config() {
             local skip_block=false
             local current_storage=""
             
+            local storage_start_re='^[[:space:]]*Storage[[:space:]]*\{'
+            local storage_name_re='^[[:space:]]*Name[[:space:]]*=[[:space:]]*"?([^"]+)"?'
+            local storage_end_re='^[[:space:]]*\}[[:space:]]*$'
             while IFS= read -r line; do
-                if [[ "$line" =~ ^Storage[[:space:]]*\{ ]]; then
+                if [[ "$line" =~ $storage_start_re ]]; then
                     in_storage=true
                     current_storage=""
                     skip_block=false
-                elif [[ "$in_storage" == true && "$line" =~ ^\s*Name[[:space:]]*="([^\"]+)" ]]; then
+                elif [[ "$in_storage" == true && "$line" =~ $storage_name_re ]]; then
                     current_storage="${BASH_REMATCH[1]}"
-                    if [[ "$current_storage" == "$storage_name" ]]; then
+                    current_storage="${current_storage%%[[:space:]]*}"
+                    if [[ "$current_storage" == "$duplicate_storage" ]]; then
                         if [[ "$first" == true ]]; then
                             first=false
                         else
@@ -2412,7 +2628,7 @@ add_job_to_bacula_config() {
                             in_storage=false
                         fi
                     fi
-                elif [[ "$line" =~ ^\}[[:space:]]*$ && "$in_storage" == true ]]; then
+                elif [[ "$line" =~ $storage_end_re && "$in_storage" == true ]]; then
                     in_storage=false
                     if [[ "$skip_block" == true ]]; then
                         skip_block=false
@@ -2438,10 +2654,6 @@ add_job_to_bacula_config() {
     elif ! grep -q "^Director {" "$config_file" 2>/dev/null; then
         base_config_exists=false
     elif ! grep -q "^Catalog {" "$config_file" 2>/dev/null; then
-        base_config_exists=false
-    elif ! grep -q "^Client {" "$config_file" 2>/dev/null; then
-        base_config_exists=false
-    elif ! grep -q "^Storage {" "$config_file" 2>/dev/null; then
         base_config_exists=false
     elif ! grep -q "^Pool {" "$config_file" 2>/dev/null; then
         base_config_exists=false
@@ -2533,6 +2745,13 @@ EOF
         3) vol_retention="1 year"; job_retention="1 year"; file_retention="1 year" ;;
         4) vol_retention="3 years"; job_retention="3 years"; file_retention="3 years" ;;
     esac
+
+    ensure_local_component_configs "$backup_path" "$director_name"
+
+    local shared_password
+    shared_password=$(get_bacula_resource_password "Director" "$director_name" "$config_file")
+    [[ -z "$shared_password" ]] && shared_password=$(get_bacula_resource_password "Director" "" "$config_file")
+    [[ -z "$shared_password" ]] && shared_password=$(generate_password)
     
     # Extraer hora y minuto
     local hour=$(echo "$backup_time" | cut -d: -f1)
@@ -2554,12 +2773,8 @@ EOF
     esac
     
     # Determinar almacenamiento
-    local storage_name="File1"
     if [[ "$storage_target" == "remote" ]]; then
-        # Intentar detectar el nombre del almacenamiento remoto configurado
-        if grep -q "Name = RemoteStorage" /etc/bacula/bacula-sd-remote.conf 2>/dev/null; then
-            storage_name=$(grep "Name =" /etc/bacula/bacula-sd-remote.conf | head -1 | cut -d= -f2 | tr -d ' "')
-        fi
+        echo -e "   ${COLOR_CYAN}Remote sync enabled: Bacula writes locally and the finished volumes are copied by SSH/rsync.${COLOR_RESET}"
     fi
 
     # Crear FileSet específico para este job
@@ -2594,19 +2809,16 @@ Schedule {
 
 EOF
     
-    local client_name="$(hostname -s)-fd"
-    local storage_name="File1"
-    
     # Verificar si Client ya existe
     local client_exists=false
-    if grep -q "Name = $client_name" /etc/bacula/bacula-dir.conf 2>/dev/null | grep -B1 "Client {" | grep -q "Name"; then
+    if bacula_resource_exists "Client" "$client_name" "$config_file"; then
         client_exists=true
         echo -e "   ${COLOR_DIM}Using existing Client: $client_name${COLOR_RESET}"
     fi
     
     # Verificar si Storage ya existe  
     local storage_exists=false
-    if grep -q "Name = $storage_name" /etc/bacula/bacula-dir.conf 2>/dev/null | grep -B1 "Storage {" | grep -q "Name"; then
+    if bacula_resource_exists "Storage" "$storage_name" "$config_file"; then
         storage_exists=true
         echo -e "   ${COLOR_DIM}Using existing Storage: $storage_name${COLOR_RESET}"
     fi
@@ -2620,9 +2832,9 @@ Client {
     Address = 127.0.0.1
     FDPort = 9102
     Catalog = MyCatalog
-    Password = "$(generate_password)"
-    File Retention = 30 days
-    Job Retention = 6 months
+    Password = "${shared_password}"
+    File Retention = $file_retention
+    Job Retention = $job_retention
     AutoPrune = yes
 }
 
@@ -2637,7 +2849,7 @@ Storage {
     Name = $storage_name
     Address = 127.0.0.1
     SDPort = 9103
-    Password = "$(generate_password)"
+    Password = "${shared_password}"
     Device = FileStorage
     Media Type = File
     Maximum Concurrent Jobs = 10
@@ -2674,6 +2886,12 @@ Job {
         RunsOnFailure = Yes
         RunsOnSuccess = Yes
         Command = "/usr/local/bin/baculamanager --close-ports"
+    }
+    RunScript {
+        RunsWhen = After
+        RunsOnSuccess = Yes
+        FailJobOnError = No
+        Command = "/usr/local/bin/bacula-remote-sync \"${job_name}\""
     }
 }
 
@@ -4222,9 +4440,11 @@ run_backup() {
     local job_count=0
     
     # Buscar jobs de backup (no restore)
+    local job_name_re='Name[[:space:]]*=[[:space:]]*"?([^"]+)"?'
     while IFS= read -r line; do
-        if [[ $line =~ Name[[:space:]]*=[[:space:]]*\"(.+)\" ]] && [[ ! $line =~ Restore_ ]]; then
+        if [[ $line =~ $job_name_re ]] && [[ ! $line =~ Restore_ ]]; then
             local job_name="${BASH_REMATCH[1]}"
+            job_name="${job_name%%[[:space:]]*}"
             # Filtrar solo jobs de backup
             if [[ $job_name != "BackupLocalFiles" ]] || [[ ! -d "$CONFIG_DIR/jobs" ]]; then
                 available_jobs+=("$job_name")
@@ -4322,6 +4542,7 @@ run_single_backup_job() {
         echo -e "   $(t "backup_job_id") ${COLOR_CYAN}$job_id${COLOR_RESET}"
         echo -e "   ${COLOR_CYAN}Job: $job_name${COLOR_RESET}"
         log_message "INFO" "Backup completed successfully, JobId: $job_id, Job: $job_name"
+        sync_remote_backups "$job_name" || true
         
         # Enviar notificación de éxito
         send_backup_notification "$job_name" "success" "$job_id" ""
@@ -4390,6 +4611,7 @@ run_legacy_backup() {
         echo -e "${COLOR_GREEN}✓ $(t "backup_success")${COLOR_RESET}"
         echo -e "   $(t "backup_job_id") ${COLOR_CYAN}$job_id${COLOR_RESET}"
         log_message "INFO" "Legacy backup completed successfully, JobId: $job_id"
+        sync_remote_backups "BackupLocalFiles" || true
         
         # Enviar notificación de éxito
         send_backup_notification "BackupLocalFiles" "success" "$job_id" ""
@@ -4603,9 +4825,11 @@ view_status() {
     
     # Buscar jobs en configuración de Bacula
     if [[ -f /etc/bacula/bacula-dir.conf ]]; then
+        local bacula_job_name_re='Name[[:space:]]*=[[:space:]]*"?([^"]+)"?'
         while IFS= read -r line; do
-            if [[ $line =~ Name[[:space:]]*=[[:space:]]*\"(.+)\" ]] && [[ ! $line =~ Restore_ ]]; then
+            if [[ $line =~ $bacula_job_name_re ]] && [[ ! $line =~ Restore_ ]]; then
                 local bacula_job_name="${BASH_REMATCH[1]}"
+                bacula_job_name="${bacula_job_name%%[[:space:]]*}"
                 # Verificar si ya está en la lista del manager
                 local already_listed=false
                 for existing_job in "${configured_jobs[@]}"; do
@@ -5466,69 +5690,97 @@ EOF
     read -rp "$(t "press_continue")"
 }
 
+install_remote_sync_helper() {
+    local helper="/usr/local/bin/bacula-remote-sync"
+
+    cat > "$helper" << 'EOF'
+#!/bin/bash
+set -euo pipefail
+
+CONFIG_DIR="/etc/bacula-manager"
+REMOTE_CONFIG_DIR="/etc/bacula-manager/remote"
+SSH_DIR="/root/.ssh"
+JOB_NAME="${1:-}"
+
+[[ -f "$REMOTE_CONFIG_DIR/active.conf" ]] || exit 0
+# shellcheck disable=SC1091
+source "$REMOTE_CONFIG_DIR/active.conf"
+[[ "${REMOTE_ENABLED:-false}" == "true" ]] || exit 0
+
+if [[ -n "$JOB_NAME" && -f "$CONFIG_DIR/jobs/${JOB_NAME}.conf" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_DIR/jobs/${JOB_NAME}.conf"
+fi
+
+BACKUP_PATH="${BACKUP_PATH:-}"
+if [[ -z "$BACKUP_PATH" && -f "$CONFIG_DIR/manager.conf" ]]; then
+    BACKUP_PATH=$(grep "^BACKUP_PATH=" "$CONFIG_DIR/manager.conf" 2>/dev/null | head -1 | cut -d= -f2-)
+fi
+BACKUP_PATH="${BACKUP_PATH:-/backups}"
+
+REMOTE_JOB_PATH="${REMOTE_PATH%/}/${JOB_NAME:-manual}"
+SSH_KEY="${SSH_DIR}/${SSH_KEY:-bacula_remote}"
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}"
+
+ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p '$REMOTE_JOB_PATH'"
+
+if command -v rsync >/dev/null 2>&1; then
+    rsync -az --partial --delete -e "ssh $SSH_OPTS" "${BACKUP_PATH%/}/" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_JOB_PATH}/"
+else
+    tar -C "$BACKUP_PATH" -cf - . | ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "tar -C '$REMOTE_JOB_PATH' -xf -"
+fi
+EOF
+
+    chmod 750 "$helper"
+    chown root:root "$helper" 2>/dev/null || true
+}
+
+sync_remote_backups() {
+    local job_name="${1:-manual}"
+
+    [[ -f "$REMOTE_CONFIG_DIR/active.conf" ]] || return 0
+    install_remote_sync_helper
+
+    if /usr/local/bin/bacula-remote-sync "$job_name"; then
+        echo -e "   ${COLOR_GREEN}✓ Remote backup sync completed${COLOR_RESET}"
+        log_message "INFO" "Remote backup sync completed for job: $job_name"
+        return 0
+    fi
+
+    echo -e "   ${COLOR_YELLOW}⚠ Remote backup sync failed; local Bacula backup remains available${COLOR_RESET}"
+    log_message "ERROR" "Remote backup sync failed for job: $job_name"
+    return 1
+}
+
 # --- Configurar almacenamiento remoto Bacula / Configure remote Bacula storage ---
 configure_remote_storage() {
     local remote_host="${1:-}"
     local remote_user="${2:-}"
     local remote_path="${3:-}"
     local connection_type="${4:-}"
-    
-    # Crear configuración de dispositivo remoto
-    local storage_config="/etc/bacula/bacula-sd-remote.conf"
-    
-    case $connection_type in
-        1)  # SSH Tunnel
-            cat > "$storage_config" << EOF
-# Remote Storage via SSH Tunnel
-# Generated by Bacula Manager
 
-Storage {
-    Name = RemoteStorage-SSH
-    Address = 127.0.0.1
-    SDPort = 9104
-    Password = "$(generate_password)"
-    Device = RemoteFileStorage
-    Media Type = RemoteFile
-    Maximum Concurrent Jobs = 5
-}
+    install_remote_sync_helper
 
-Device {
-    Name = RemoteFileStorage
-    Media Type = RemoteFile
-    Archive Device = "ssh:${remote_user}@${remote_host}:${remote_path}"
-    LabelMedia = yes
-    Random Access = yes
-    AutomaticMount = yes
-    RemovableMedia = no
-    AlwaysOpen = no
-}
+    local key_path="${SSH_DIR}/bacula_remote"
+    ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new \
+        -i "$key_path" "${remote_user}@${remote_host}" \
+        "mkdir -p '${remote_path}' && test -w '${remote_path}'" 2>/dev/null || {
+        echo -e "${COLOR_YELLOW}⚠ Remote directory could not be verified now. Jobs will still sync when connectivity is available.${COLOR_RESET}"
+        log_message "WARN" "Remote backup path verification failed: ${remote_user}@${remote_host}:${remote_path}"
+    }
+
+    cat > /etc/bacula/bacula-sd-remote.conf << EOF
+# Remote backup sync configuration
+# Generated by Bacula Manager v${SCRIPT_VERSION}
+#
+# Bacula stores volumes in the local FileStorage device. After a job finishes,
+# /usr/local/bin/bacula-remote-sync copies those volumes to:
+# ${remote_user}@${remote_host}:${remote_path}
 EOF
-            # Configurar túnel SSH automático
-            setup_ssh_tunnel "$remote_host" "$remote_user" 9104 9103
-            ;;
-        2|3)  # Direct o VPN
-            cat > "$storage_config" << EOF
-# Remote Storage Direct Connection
-# Generated by Bacula Manager
+    chmod 640 /etc/bacula/bacula-sd-remote.conf 2>/dev/null || true
+    chown root:bacula /etc/bacula/bacula-sd-remote.conf 2>/dev/null || true
 
-Storage {
-    Name = RemoteStorage-Direct
-    Address = $remote_host
-    SDPort = 9103
-    Password = "$(generate_password)"
-    Device = RemoteFileStorage
-    Media Type = RemoteFile
-    Maximum Concurrent Jobs = 5
-}
-EOF
-            ;;
-    esac
-    
-    chmod 640 "$storage_config"
-    chown root:bacula "$storage_config"
-    
-    # Actualizar configuración del Director para incluir almacenamiento remoto
-    update_director_for_remote "$storage_config"
+    log_message "INFO" "Remote sync configured over SSH/rsync: ${remote_user}@${remote_host}:${remote_path} (mode $connection_type)"
 }
 
 # --- Configurar túnel SSH / Setup SSH tunnel ---
@@ -5576,6 +5828,8 @@ EOF
 # --- Actualizar Director para soporte remoto / Update Director for remote support ---
 update_director_for_remote() {
     local storage_config="${1:-}"
+    log_message "INFO" "Remote Director update skipped; remote backups use SSH/rsync sync helper: $storage_config"
+    return 0
     
     # Agregar @include al bacula-dir.conf si no existe
     if ! grep -q "@$storage_config" /etc/bacula/bacula-dir.conf 2>/dev/null; then
@@ -5817,15 +6071,35 @@ fix_bacula_permissions() {
 auto_fix_bacula_issues() {
     local config_file="/etc/bacula/bacula-dir.conf"
     local fixed=false
+    local pg_service="postgresql"
+    local pg_hba_file=""
+    local pg_version=""
+    local pg_cluster="main"
+    local pg_port="5432"
+
+    if command -v pg_lsclusters >/dev/null 2>&1; then
+        local cluster_info
+        cluster_info=$(pg_lsclusters | awk '$1 ~ /^[0-9]+/ {print; exit}')
+        if [[ -n "$cluster_info" ]]; then
+            pg_version=$(echo "$cluster_info" | awk '{print $1}')
+            pg_cluster=$(echo "$cluster_info" | awk '{print $2}')
+            pg_port=$(echo "$cluster_info" | awk '{print $3}')
+            pg_service="postgresql@${pg_version}-${pg_cluster}"
+            pg_hba_file="/etc/postgresql/${pg_version}/${pg_cluster}/pg_hba.conf"
+        fi
+    fi
+    if [[ -z "$pg_hba_file" ]]; then
+        pg_hba_file=$(find /etc/postgresql -path "*/pg_hba.conf" 2>/dev/null | sort -V | tail -1)
+    fi
     
     echo -e "    ${COLOR_CYAN}→ Running auto-fix routines...${COLOR_RESET}"
     
     # 1. Verificar e iniciar PostgreSQL si no está corriendo
-    if ! systemctl is-active --quiet postgresql@17-main 2>/dev/null && ! systemctl is-active --quiet postgresql 2>/dev/null; then
+    if ! systemctl is-active --quiet "$pg_service" 2>/dev/null && ! systemctl is-active --quiet postgresql 2>/dev/null; then
         echo -e "      ${COLOR_YELLOW}⚠ PostgreSQL not running, attempting to start...${COLOR_RESET}"
-        systemctl start postgresql@17-main 2>/dev/null || systemctl start postgresql 2>/dev/null
+        systemctl start "$pg_service" 2>/dev/null || systemctl start postgresql 2>/dev/null
         sleep 3
-        if systemctl is-active --quiet postgresql@17-main 2>/dev/null || systemctl is-active --quiet postgresql 2>/dev/null; then
+        if systemctl is-active --quiet "$pg_service" 2>/dev/null || systemctl is-active --quiet postgresql 2>/dev/null; then
             echo -e "      ${COLOR_GREEN}✓ PostgreSQL started${COLOR_RESET}"
             fixed=true
         else
@@ -5834,7 +6108,6 @@ auto_fix_bacula_issues() {
     fi
     
     # 2. Verificar y corregir pg_hba.conf si es necesario
-    local pg_hba_file="/etc/postgresql/17/main/pg_hba.conf"
     if [[ -f "$pg_hba_file" ]]; then
         if ! grep -q "bacula" "$pg_hba_file"; then
             echo -e "      ${COLOR_YELLOW}⚠ Adding bacula auth rules to pg_hba.conf...${COLOR_RESET}"
@@ -5845,22 +6118,22 @@ local   bacula          bacula                                  scram-sha-256\
 host    bacula          bacula          127.0.0.1/32            scram-sha-256\
 host    bacula          bacula          ::1/128                 scram-sha-256\
 ' "$pg_hba_file"
-            systemctl reload postgresql@17-main 2>/dev/null || systemctl reload postgresql 2>/dev/null
+            systemctl reload "$pg_service" 2>/dev/null || systemctl reload postgresql 2>/dev/null
             echo -e "      ${COLOR_GREEN}✓ pg_hba.conf updated${COLOR_RESET}"
             fixed=true
         fi
     fi
     
     # 3. Verificar y crear tablas de Bacula si no existen
-    if ! su - postgres -c "psql -d bacula -c 'SELECT 1 FROM Version LIMIT 1;'" 2>/dev/null | grep -q 1; then
+    if ! su - postgres -c "psql -p $pg_port -d bacula -c 'SELECT 1 FROM Version LIMIT 1;'" 2>/dev/null | grep -q 1; then
         echo -e "      ${COLOR_YELLOW}⚠ Bacula tables not found, creating...${COLOR_RESET}"
         if [[ -f "/usr/share/bacula-director/make_postgresql_tables" ]]; then
             sed -n '/^CREATE TABLE/,/^END-OF-DATA/p' /usr/share/bacula-director/make_postgresql_tables 2>/dev/null | head -n -1 > /tmp/bacula_fix_tables.sql
             if [[ -s /tmp/bacula_fix_tables.sql ]]; then
-                su - postgres -c "psql -d bacula -f /tmp/bacula_fix_tables.sql" 2>/dev/null
+                su - postgres -c "psql -p $pg_port -d bacula -f /tmp/bacula_fix_tables.sql" 2>/dev/null
                 rm -f /tmp/bacula_fix_tables.sql
                 sed -n '/^grant all/,/^END-OF-DATA/p' /usr/share/bacula-director/grant_postgresql_privileges 2>/dev/null | sed 's/\\${db_name}/bacula/g; s/\\${db_user}/bacula/g' > /tmp/bacula_fix_grants.sql
-                su - postgres -c "psql -d bacula -f /tmp/bacula_fix_grants.sql" 2>/dev/null
+                su - postgres -c "psql -p $pg_port -d bacula -f /tmp/bacula_fix_grants.sql" 2>/dev/null
                 rm -f /tmp/bacula_fix_grants.sql
                 echo -e "      ${COLOR_GREEN}✓ Bacula tables created${COLOR_RESET}"
                 fixed=true
@@ -5868,13 +6141,32 @@ host    bacula          bacula          ::1/128                 scram-sha-256\
         fi
     fi
     
-    # 4. Sincronizar contraseñas
+    # 4. Sincronizar contraseñas con verificación
     local config_password=$(grep -E "^\\s*dbpassword\\s*=" "$config_file" 2>/dev/null | head -1 | sed 's/.*=\\s*"\\([^"]*\\)".*/\\1/')
     if [[ -n "$config_password" ]]; then
         echo -e "      ${COLOR_CYAN}→ Syncing database password...${COLOR_RESET}"
-        su - postgres -c "psql -c \"ALTER USER bacula WITH PASSWORD '${config_password}';\"" 2>/dev/null
-        echo -e "      ${COLOR_GREEN}✓ Password synchronized${COLOR_RESET}"
-        fixed=true
+        
+        # Intentar actualizar contraseña
+        if su - postgres -c "psql -p $pg_port -c \"ALTER USER bacula WITH PASSWORD '${config_password}';\"" 2>/dev/null; then
+            echo -e "      ${COLOR_GREEN}✓ Password updated in PostgreSQL${COLOR_RESET}"
+            
+            # Verificar que la conexión funciona
+            export PGPASSWORD="$config_password"
+            if psql -h localhost -p "$pg_port" -U bacula -d bacula -c "SELECT 1;" >/dev/null 2>&1; then
+                echo -e "      ${COLOR_GREEN}✓ Connection test passed${COLOR_RESET}"
+                fixed=true
+            else
+                echo -e "      ${COLOR_YELLOW}⚠ Password updated but connection failed - trying default${COLOR_RESET}"
+                # Intentar con contraseña "bacula" por defecto
+                su - postgres -c "psql -p $pg_port -c \"ALTER USER bacula WITH PASSWORD 'bacula';\"" 2>/dev/null
+                sed -i "s/dbpassword = \"[^\"]*\"/dbpassword = \"bacula\"/g" "$config_file"
+                echo -e "      ${COLOR_YELLOW}⚠ Reset to default password 'bacula'${COLOR_RESET}"
+                fixed=true
+            fi
+            unset PGPASSWORD
+        else
+            echo -e "      ${COLOR_RED}✗ Failed to update password${COLOR_RESET}"
+        fi
     fi
     
     # 5. Corregir errores de sintaxis en FileSets
@@ -6286,6 +6578,11 @@ handle_args() {
             open_bacula_ports "close"
             exit 0
             ;;
+        --sync-remote)
+            check_root
+            sync_remote_backups "${2:-manual}"
+            exit 0
+            ;;
         --help|-h)
             echo ""
             echo "Bacula Backup Manager - v${SCRIPT_VERSION}"
@@ -6301,6 +6598,7 @@ handle_args() {
             echo "  --check             Run configuration tests"
             echo "  --open-ports        Open Bacula firewall ports"
             echo "  --close-ports       Close Bacula firewall ports"
+            echo "  --sync-remote JOB   Sync local backup volumes to configured remote host"
             echo "  --help, -h          Show this help"
             echo ""
             echo "Examples:"
