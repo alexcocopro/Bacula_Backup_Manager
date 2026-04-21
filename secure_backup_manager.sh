@@ -34,6 +34,8 @@ CURRENT_LOG=""
 STOPPED_SERVICES=()
 APP_LANG="${APP_LANG:-es}"
 LANGUAGE_SELECTED="${LANGUAGE_SELECTED:-false}"
+SNAPSHOT_PATH=""
+SNAPSHOT_BACKUP=""
 
 info() { echo -e "${C_CYAN}[*]${C_RESET} $*"; log "INFO" "$*"; }
 ok() { echo -e "${C_GREEN}[+]${C_RESET} $*"; log "INFO" "$*"; }
@@ -285,6 +287,15 @@ cleanup_services() {
 on_error() {
     local line="${1:-unknown}"
     fail "Error en linea $line. Revise log: ${CURRENT_LOG:-sin log}"
+    if [[ -n "${SNAPSHOT_PATH:-}" ]]; then
+        if [[ -n "${SNAPSHOT_BACKUP:-}" && -f "$SNAPSHOT_BACKUP" ]]; then
+            cp "$SNAPSHOT_BACKUP" "$SNAPSHOT_PATH" 2>/dev/null || true
+            log "WARN" "Incremental snapshot restored after failed backup"
+        elif [[ -f "$SNAPSHOT_PATH" ]]; then
+            rm -f "$SNAPSHOT_PATH" 2>/dev/null || true
+            log "WARN" "Partial incremental snapshot removed after failed backup"
+        fi
+    fi
     cleanup_services
     if [[ -n "${JOB_ID:-}" && -n "${CURRENT_LOG:-}" ]]; then
         notify_result "FAILED" "${BACKUP_ID:-}"
@@ -353,6 +364,52 @@ prepare_tar_file_list() {
     if [[ ! -s "$file_list" ]] && ! { [[ -d "$dump_dir" ]] && find "$dump_dir" -type f -print -quit | grep -q .; }; then
         die "No hay directorios ni dumps para respaldar"
     fi
+}
+
+create_backup_archive() {
+    local archive="$1"
+    local snapshot="$2"
+    local file_list="$3"
+    local work_dir="$4"
+    local dump_dir="$5"
+    local tar_log="${archive}.tar.log"
+    local tar_status=0
+
+    local tar_args=(
+        --create
+        --gzip
+        --listed-incremental="$snapshot"
+        --file="$archive"
+        --ignore-failed-read
+        --warning=no-file-changed
+        --warning=no-file-removed
+    )
+
+    if [[ -s "$EXCLUDES_FILE" ]]; then
+        tar_args+=(--exclude-from="$EXCLUDES_FILE")
+    fi
+    if [[ -s "$file_list" ]]; then
+        tar_args+=(--files-from="$file_list")
+    fi
+    if [[ -d "$dump_dir" ]] && find "$dump_dir" -type f -print -quit | grep -q .; then
+        tar_args+=(-C "$work_dir" "_db_dumps")
+    fi
+
+    tar "${tar_args[@]}" > "$tar_log" 2>&1 || tar_status=$?
+    cat "$tar_log" >> "$CURRENT_LOG" 2>/dev/null || true
+
+    if [[ $tar_status -eq 0 ]]; then
+        return 0
+    fi
+
+    if [[ $tar_status -eq 1 && -s "$archive" ]]; then
+        warn "tar finalizo con advertencias recuperables; el archivo se verificara con SHA256"
+        log "WARN" "tar exit code 1 tolerated because archive was created: $archive"
+        return 0
+    fi
+
+    fail "tar fallo con codigo $tar_status. Detalle: $tar_log"
+    return "$tar_status"
 }
 
 make_manifest() {
@@ -445,6 +502,13 @@ run_backup() {
     local snapshot="${STATE_DIR}/${JOB_ID}.snar"
     local chain_file="${STATE_DIR}/${JOB_ID}.chain"
     local backup_type="$requested_type"
+    SNAPSHOT_PATH="$snapshot"
+    SNAPSHOT_BACKUP="${STATE_DIR}/${JOB_ID}.snar.pre-${BACKUP_ID}"
+    if [[ -f "$snapshot" ]]; then
+        cp "$snapshot" "$SNAPSHOT_BACKUP"
+    else
+        SNAPSHOT_BACKUP=""
+    fi
 
     if [[ "$backup_type" != "full" && "$backup_type" != "incremental" ]]; then
         die "Tipo invalido: $backup_type. Use full o incremental"
@@ -494,17 +558,7 @@ run_backup() {
     prepare_tar_file_list "$file_list" "$dump_dir"
 
     info "Creando archivo tar.gz"
-    local tar_args=(--create --gzip --listed-incremental="$snapshot" --file="$archive")
-    if [[ -s "$EXCLUDES_FILE" ]]; then
-        tar_args+=(--exclude-from="$EXCLUDES_FILE")
-    fi
-    if [[ -s "$file_list" ]]; then
-        tar_args+=(--files-from="$file_list")
-    fi
-    if [[ -d "$dump_dir" ]] && find "$dump_dir" -type f -print -quit | grep -q .; then
-        tar_args+=(-C "$work_dir" "_db_dumps")
-    fi
-    tar "${tar_args[@]}" >> "$CURRENT_LOG" 2>&1
+    create_backup_archive "$archive" "$snapshot" "$file_list" "$work_dir" "$dump_dir"
 
     info "Generando hash SHA256"
     (cd "$backup_dir" && sha256sum "$(basename "$archive")" > "$(basename "$hash_file")")
@@ -518,6 +572,8 @@ run_backup() {
 
     sync_remote "$backup_dir" "$archive" "$hash_file" "$manifest"
     prune_old_backups
+    [[ -n "${SNAPSHOT_BACKUP:-}" ]] && rm -f "$SNAPSHOT_BACKUP"
+    SNAPSHOT_BACKUP=""
 
     ok "Respaldo completado: $backup_dir"
     notify_result "SUCCESS" "$BACKUP_ID"
