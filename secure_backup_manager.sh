@@ -93,7 +93,7 @@ t() {
         restore) [[ "$APP_LANG" == "en" ]] && echo "Restore backup" || echo "Restaurar respaldo" ;;
         decrypt) [[ "$APP_LANG" == "en" ]] && echo "Decrypt encrypted backup" || echo "Desencriptar respaldo cifrado" ;;
         ssh_key) [[ "$APP_LANG" == "en" ]] && echo "Show SSH public key" || echo "Mostrar llave publica SSH" ;;
-        delete_job) [[ "$APP_LANG" == "en" ]] && echo "Delete backup job" || echo "Eliminar trabajo de respaldo" ;;
+        delete_job) [[ "$APP_LANG" == "en" ]] && echo "Delete jobs/backups" || echo "Eliminar trabajos/respaldos" ;;
         language) [[ "$APP_LANG" == "en" ]] && echo "Language / Idioma" || echo "Idioma / Language" ;;
         exit) [[ "$APP_LANG" == "en" ]] && echo "Exit" || echo "Salir" ;;
         option) [[ "$APP_LANG" == "en" ]] && echo "Option" || echo "Opcion" ;;
@@ -1335,6 +1335,201 @@ delete_job() {
     ok "Trabajo eliminado / Job deleted: $JOB_ID"
 }
 
+select_existing_job() {
+    ensure_base_dirs
+
+    local choices=()
+    local job index=1
+
+    echo "" >&2
+    echo "Trabajos configurados / Configured jobs:" >&2
+    printf '%-4s %-24s %-28s %s\n' "#" "JOB_ID" "Nombre / Name" "Ruta local / Local path" >&2
+
+    while IFS= read -r job; do
+        load_job "$job"
+        printf '%-4s %-24s %-28s %s\n' "$index" "$JOB_ID" "$JOB_NAME" "$BACKUP_ROOT" >&2
+        choices+=("$JOB_ID")
+        ((++index))
+    done < <(list_jobs)
+
+    [[ ${#choices[@]} -gt 0 ]] || die "No hay trabajos configurados / No configured jobs"
+
+    local selected
+    selected="$(prompt_choice "Seleccione trabajo / Select job" 1 "${#choices[@]}" 1)"
+    echo "${choices[$((selected - 1))]}"
+}
+
+load_job_list() {
+    local -n out_jobs="$1"
+    local job
+    out_jobs=()
+    while IFS= read -r job; do
+        out_jobs+=("$job")
+    done < <(list_jobs)
+}
+
+remove_job_config_only() {
+    local job_id="$1"
+    local delete_ssh="${2:-false}"
+    local delete_secret="${3:-false}"
+    load_job "$job_id"
+
+    remove_timers "$JOB_ID"
+    rm -f "$JOB_FILE" "$DIRS_FILE" "$EXCLUDES_FILE" "$SERVICES_FILE" "$DB_NAMES_FILE"
+    rm -f "${STATE_DIR}/${JOB_ID}.snar" "${STATE_DIR}/${JOB_ID}.chain" "${STATE_DIR}/${JOB_ID}.snar.pre-"*
+
+    if [[ "$delete_ssh" == "true" ]]; then
+        rm -f "$SSH_KEY" "${SSH_KEY}.pub"
+    fi
+    if [[ "$delete_secret" == "true" && -n "${ENCRYPTION_PASS_FILE:-}" ]]; then
+        rm -f "$ENCRYPTION_PASS_FILE"
+    fi
+}
+
+ensure_safe_backup_root() {
+    local root="${1:-}"
+    [[ -n "$root" && "$root" != "/" && -d "$root" ]] || die "Ruta de respaldos insegura o inexistente: ${root:-empty}"
+}
+
+delete_all_jobs_keep_backups() {
+    require_root
+    ensure_base_dirs
+
+    echo "Esto eliminara TODOS los trabajos configurados y deshabilitara sus timers."
+    echo "Los respaldos locales existentes NO se eliminaran."
+    warn "Si elimina passwords guardados, necesitara recordar la contrasena para restaurar respaldos cifrados."
+    if ! prompt_yes_no "Continuar? / Continue? (s/n, y/n)" "n"; then
+        warn "Cancelado / Cancelled"
+        return 0
+    fi
+
+    local delete_ssh="false" delete_secret="false"
+    prompt_yes_no "Eliminar tambien llaves SSH de los trabajos? / Delete job SSH keys too? (s/n, y/n)" "n" && delete_ssh="true"
+    prompt_yes_no "Eliminar tambien passwords de cifrado guardados? / Delete stored encryption passwords too? (s/n, y/n)" "n" && delete_secret="true"
+
+    local jobs=()
+    load_job_list jobs
+
+    local job count=0
+    for job in "${jobs[@]}"; do
+        remove_job_config_only "$job" "$delete_ssh" "$delete_secret"
+        ((++count))
+    done
+
+    ok "Trabajos eliminados / Jobs deleted: $count"
+    warn "Respaldos locales conservados / Local backups kept"
+}
+
+delete_backup_dirs_for_job() {
+    local job_id="$1"
+    load_job "$job_id"
+    ensure_safe_backup_root "$BACKUP_ROOT"
+
+    local backup_dir count=0
+    while IFS= read -r backup_dir; do
+        rm -rf "$backup_dir"
+        ((++count))
+    done < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20*' 2>/dev/null | sort)
+
+    rm -f "${STATE_DIR}/${JOB_ID}.snar" "${STATE_DIR}/${JOB_ID}.chain" "${STATE_DIR}/${JOB_ID}.snar.pre-"*
+    echo "$count"
+}
+
+delete_all_backups_keep_jobs() {
+    require_root
+    ensure_base_dirs
+
+    echo "Esto eliminara TODOS los respaldos realizados de todos los trabajos."
+    echo "Los trabajos, timers, llaves SSH y passwords guardados NO se eliminaran."
+    warn "Se reiniciara el estado incremental para que el proximo incremental cree un nuevo full si hace falta."
+    if ! prompt_yes_no "Continuar? / Continue? (s/n, y/n)" "n"; then
+        warn "Cancelado / Cancelled"
+        return 0
+    fi
+
+    local jobs=()
+    load_job_list jobs
+
+    local job removed total=0
+    for job in "${jobs[@]}"; do
+        removed="$(delete_backup_dirs_for_job "$job")"
+        total=$((total + removed))
+    done
+
+    ok "Respaldos eliminados / Backups deleted: $total"
+    ok "Trabajos conservados / Jobs kept"
+}
+
+delete_selected_job_keep_backups() {
+    require_root
+    local job_id delete_ssh="false" delete_secret="false"
+    job_id="$(select_existing_job)"
+
+    echo ""
+    show_job_config "$job_id"
+    echo ""
+    warn "Se eliminara solo la configuracion del trabajo. Los respaldos locales se conservaran."
+    if ! prompt_yes_no "Continuar? / Continue? (s/n, y/n)" "n"; then
+        warn "Cancelado / Cancelled"
+        return 0
+    fi
+
+    prompt_yes_no "Eliminar tambien la llave SSH de este trabajo? / Delete this job SSH key too? (s/n, y/n)" "n" && delete_ssh="true"
+    prompt_yes_no "Eliminar tambien el password de cifrado guardado? / Delete stored encryption password too? (s/n, y/n)" "n" && delete_secret="true"
+    remove_job_config_only "$job_id" "$delete_ssh" "$delete_secret"
+    ok "Trabajo eliminado y respaldos conservados / Job deleted and backups kept: $job_id"
+}
+
+delete_selected_backup_keep_job() {
+    require_root
+    local selected job_id backup_id backup_dir
+    selected="$(select_existing_backup "eliminar")"
+    job_id="${selected%%|*}"
+    backup_id="${selected#*|}"
+    load_job "$job_id"
+    ensure_safe_backup_root "$BACKUP_ROOT"
+
+    backup_dir="${BACKUP_ROOT}/${backup_id}"
+    [[ -d "$backup_dir" && "$backup_id" == 20* ]] || die "Ruta de respaldo invalida: $backup_dir"
+
+    warn "Eliminar un respaldo individual puede romper una cadena incremental si otros respaldos dependen de el."
+    echo "Trabajo / Job: $JOB_ID"
+    echo "Respaldo / Backup: $backup_id"
+    echo "Ruta / Path: $backup_dir"
+    if ! prompt_yes_no "Eliminar este respaldo? / Delete this backup? (s/n, y/n)" "n"; then
+        warn "Cancelado / Cancelled"
+        return 0
+    fi
+
+    rm -rf "$backup_dir"
+    if prompt_yes_no "Reiniciar estado incremental de este trabajo? / Reset incremental state for this job? (s/n, y/n)" "s"; then
+        rm -f "${STATE_DIR}/${JOB_ID}.snar" "${STATE_DIR}/${JOB_ID}.chain" "${STATE_DIR}/${JOB_ID}.snar.pre-"*
+        warn "Estado incremental reiniciado; el proximo incremental creara un full si hace falta."
+    fi
+    ok "Respaldo eliminado / Backup deleted: $backup_id"
+}
+
+delete_menu() {
+    require_root
+    ensure_base_dirs
+
+    echo ""
+    echo "Eliminar / Delete"
+    echo "1) Eliminar TODOS los trabajos sin eliminar respaldos"
+    echo "2) Eliminar TODOS los respaldos sin eliminar trabajos"
+    echo "3) Seleccionar un trabajo para eliminarlo sin eliminar sus respaldos"
+    echo "4) Seleccionar un respaldo realizado para eliminarlo"
+    echo "0) Volver / Back"
+
+    case "$(prompt_choice "Opcion / Option" 0 4 0)" in
+        1) delete_all_jobs_keep_backups ;;
+        2) delete_all_backups_keep_jobs ;;
+        3) delete_selected_job_keep_backups ;;
+        4) delete_selected_backup_keep_job ;;
+        0) return 0 ;;
+    esac
+}
+
 configure_job() {
     require_root
     ensure_base_dirs
@@ -1520,7 +1715,7 @@ menu() {
             8) restore_backup_interactive ;;
             9) decrypt_backup_interactive ;;
             10) generate_ssh_key "$(prompt "$(t job_id)")" ;;
-            11) delete_job "$(prompt "$(t job_id)")" ;;
+            11) delete_menu ;;
             12) choose_language ;;
             0) exit 0 ;;
             *) warn "$(t invalid)" ;;
@@ -1542,7 +1737,7 @@ main() {
         decrypt) shift; [[ $# -gt 0 ]] && decrypt_backup "$@" || decrypt_backup_interactive ;;
         timers) shift; install_timers "$@" ;;
         remote-key) shift; generate_ssh_key "$@" ;;
-        delete) shift; delete_job "$@" ;;
+        delete) shift; [[ $# -gt 0 ]] && delete_job "$@" || delete_menu ;;
         menu|"") menu ;;
         help|-h|--help) usage ;;
         *) usage; exit 1 ;;
