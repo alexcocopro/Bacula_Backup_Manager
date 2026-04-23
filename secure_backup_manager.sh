@@ -563,10 +563,16 @@ make_manifest() {
 
 remote_parts() {
     local dest="${REMOTE_DEST:-}"
-    [[ "$dest" == *:* ]] || die "REMOTE_DEST debe tener formato user@host:/ruta"
+    if [[ "$dest" != *:* ]]; then
+        warn "REMOTE_DEST debe tener formato user@host:/ruta"
+        return 1
+    fi
     REMOTE_HOST="${dest%%:*}"
     REMOTE_PATH="${dest#*:}"
-    [[ -n "$REMOTE_HOST" && -n "$REMOTE_PATH" ]] || die "REMOTE_DEST invalido"
+    if [[ -z "$REMOTE_HOST" || -z "$REMOTE_PATH" ]]; then
+        warn "REMOTE_DEST invalido"
+        return 1
+    fi
 }
 
 sync_remote() {
@@ -576,21 +582,39 @@ sync_remote() {
     local manifest="$4"
 
     [[ "$REMOTE_ENABLED" == "true" ]] || return 0
-    [[ -f "$SSH_KEY" ]] || die "No existe llave SSH: $SSH_KEY. Use: $0 remote-key $JOB_ID"
-    remote_parts
+    if [[ ! -f "$SSH_KEY" ]]; then
+        warn "No existe llave SSH para sincronizacion remota: $SSH_KEY. Use: $0 remote-key $JOB_ID"
+        return 1
+    fi
+    if ! remote_parts; then
+        warn "Configuracion remota invalida. El respaldo local se conservara."
+        return 1
+    fi
 
     local remote_job_dir="${REMOTE_PATH%/}/${JOB_ID}"
     local ssh_base=(ssh -i "$SSH_KEY" -p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$REMOTE_HOST")
     local rsync_ssh="ssh -i $(shell_quote "$SSH_KEY") -p $(shell_quote "$SSH_PORT") -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 
     info "Creando destino remoto: ${REMOTE_HOST}:${remote_job_dir}"
-    "${ssh_base[@]}" "mkdir -p $(shell_quote "$remote_job_dir")"
+    if ! "${ssh_base[@]}" "mkdir -p $(shell_quote "$remote_job_dir")" >> "$CURRENT_LOG" 2>&1; then
+        warn "No se pudo crear el destino remoto. Revise host, usuario, puerto SSH, llave y ruta remota."
+        warn "Detalle en log: $CURRENT_LOG"
+        return 1
+    fi
 
     info "Enviando respaldo remoto con rsync"
-    rsync -az --protect-args -e "$rsync_ssh" "$backup_dir/" "${REMOTE_HOST}:${remote_job_dir}/" >> "$CURRENT_LOG" 2>&1
+    if ! rsync -az --protect-args -e "$rsync_ssh" "$backup_dir/" "${REMOTE_HOST}:${remote_job_dir}/" >> "$CURRENT_LOG" 2>&1; then
+        warn "No se pudo enviar el respaldo remoto con rsync. El respaldo local se conserva."
+        warn "Detalle en log: $CURRENT_LOG"
+        return 1
+    fi
 
     info "Verificando hash en remoto"
-    "${ssh_base[@]}" "cd $(shell_quote "${remote_job_dir}/$(basename "$backup_dir")") && sha256sum -c $(shell_quote "$(basename "$hash_file")")" >> "$CURRENT_LOG" 2>&1
+    if ! "${ssh_base[@]}" "cd $(shell_quote "${remote_job_dir}/$(basename "$backup_dir")") && sha256sum -c $(shell_quote "$(basename "$hash_file")")" >> "$CURRENT_LOG" 2>&1; then
+        warn "El respaldo remoto se envio, pero fallo la verificacion SHA256 remota."
+        warn "Detalle en log: $CURRENT_LOG"
+        return 1
+    fi
 
     ok "Respaldo remoto verificado"
 }
@@ -698,13 +722,21 @@ run_backup() {
     (cd "$backup_dir" && sha256sum -c "$(basename "$hash_file")") >> "$CURRENT_LOG" 2>&1
     mark_backup_verified "$backup_dir"
 
-    sync_remote "$backup_dir" "$archive" "$hash_file" "$manifest"
+    local remote_status="success"
+    if ! sync_remote "$backup_dir" "$archive" "$hash_file" "$manifest"; then
+        remote_status="failed"
+        warn "El respaldo local se completo, pero la sincronizacion remota fallo."
+    fi
     prune_old_backups
     [[ -n "${SNAPSHOT_BACKUP:-}" ]] && rm -f "$SNAPSHOT_BACKUP"
     SNAPSHOT_BACKUP=""
 
-    ok "Respaldo completado: $backup_dir"
-    notify_result "SUCCESS" "$BACKUP_ID"
+    ok "Respaldo local completado: $backup_dir"
+    if [[ "$remote_status" == "failed" ]]; then
+        notify_result "REMOTE_FAILED" "$BACKUP_ID"
+    else
+        notify_result "SUCCESS" "$BACKUP_ID"
+    fi
 }
 
 list_jobs() {
@@ -1145,9 +1177,10 @@ generate_ssh_key() {
     cat "${SSH_KEY}.pub"
     echo ""
     if [[ -n "${REMOTE_DEST:-}" ]]; then
-        remote_parts
-        echo "Prueba manual:"
-        echo "  ssh -i $SSH_KEY -p $SSH_PORT $REMOTE_HOST 'mkdir -p ${REMOTE_PATH%/}/${JOB_ID}'"
+        if remote_parts; then
+            echo "Prueba manual:"
+            echo "  ssh -i $SSH_KEY -p $SSH_PORT $REMOTE_HOST 'mkdir -p ${REMOTE_PATH%/}/${JOB_ID}'"
+        fi
     fi
 }
 
