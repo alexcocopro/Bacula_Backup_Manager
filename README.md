@@ -21,6 +21,7 @@
 - Modo logico en caliente o modo frio deteniendo servicios.
 - Cifrado opcional del archivo de respaldo con OpenSSL `AES-256-CBC` y PBKDF2.
 - Descifrado durante restauracion mediante contrasena.
+- Descifrado local desde un directorio o archivo `.tar.gz.enc`, util en equipos remotos.
 - Hash SHA256 para verificar integridad del archivo guardado, cifrado o no cifrado.
 - Estado de respaldos: `VERIFICADO` o `NO VERIFICADO`.
 - Restauracion de cadena full + incrementales.
@@ -41,6 +42,7 @@
 - Logical hot backup mode or cold mode by stopping services.
 - Optional backup archive encryption with OpenSSL `AES-256-CBC` and PBKDF2.
 - Password-based decryption during restore.
+- Local decryption from a directory or `.tar.gz.enc` file, useful on remote machines.
 - SHA256 hash verification for the stored file, encrypted or unencrypted.
 - Backup state: `VERIFIED` or `NOT VERIFIED`.
 - Full + incremental chain restore.
@@ -439,7 +441,19 @@ Para descifrar un `.tar.gz.enc` sin restaurarlo:
 sudo secure-backup-manager decrypt JOB_ID BACKUP_ID /ruta/salida.tar.gz
 ```
 
-Tambien puede usar la opcion del menu `Desencriptar respaldo cifrado`. El programa muestra solo respaldos cifrados, verifica el SHA256 del `.enc`, pide la contrasena y genera un `.tar.gz` descifrado en la ruta indicada.
+Si el respaldo cifrado fue copiado a otro equipo y no existe el trabajo configurado alli, use:
+
+```bash
+sudo secure-backup-manager decrypt-local /ruta/directorio-respaldo /ruta/salida.tar.gz
+```
+
+Tambien puede pasar directamente el archivo:
+
+```bash
+sudo secure-backup-manager decrypt-local /ruta/JOB_ID-BACKUP_ID.tar.gz.enc /ruta/salida.tar.gz
+```
+
+Tambien puede usar la opcion del menu `Desencriptar respaldo cifrado`. El programa permite elegir entre respaldos configurados o un directorio/archivo local, verifica el SHA256 del `.enc` si esta disponible, pide la contrasena y genera un `.tar.gz` descifrado en la ruta indicada.
 
 Advertencia: el `.tar.gz` descifrado contiene los datos originales sin cifrar. Protejalo con permisos adecuados y eliminelo cuando ya no sea necesario.
 
@@ -451,7 +465,19 @@ To decrypt a `.tar.gz.enc` without restoring it:
 sudo secure-backup-manager decrypt JOB_ID BACKUP_ID /path/output.tar.gz
 ```
 
-You can also use the `Decrypt encrypted backup` menu option. The program shows only encrypted backups, verifies the `.enc` SHA256, asks for the password, and creates a decrypted `.tar.gz` at the selected path.
+If the encrypted backup was copied to another machine and the backup job is not configured there, use:
+
+```bash
+sudo secure-backup-manager decrypt-local /path/backup-directory /path/output.tar.gz
+```
+
+You can also pass the file directly:
+
+```bash
+sudo secure-backup-manager decrypt-local /path/JOB_ID-BACKUP_ID.tar.gz.enc /path/output.tar.gz
+```
+
+You can also use the `Decrypt encrypted backup` menu option. The program lets you choose between configured backups or a local directory/file, verifies the `.enc` SHA256 if available, asks for the password, and creates a decrypted `.tar.gz` at the selected path.
 
 Warning: the decrypted `.tar.gz` contains the original data without encryption. Protect it with appropriate permissions and remove it when it is no longer needed.
 
@@ -804,6 +830,7 @@ sudo secure-backup-manager list JOB_ID
 sudo secure-backup-manager verify JOB_ID BACKUP_ID
 sudo secure-backup-manager restore JOB_ID BACKUP_ID /ruta/destino
 sudo secure-backup-manager decrypt JOB_ID BACKUP_ID /ruta/salida.tar.gz
+sudo secure-backup-manager decrypt-local /ruta/respaldo /ruta/salida.tar.gz
 sudo secure-backup-manager remote-key JOB_ID
 sudo secure-backup-manager delete
 sudo secure-backup-manager delete JOB_ID
@@ -822,6 +849,7 @@ sudo secure-backup-manager list JOB_ID
 sudo secure-backup-manager verify JOB_ID BACKUP_ID
 sudo secure-backup-manager restore JOB_ID BACKUP_ID /restore/path
 sudo secure-backup-manager decrypt JOB_ID BACKUP_ID /path/output.tar.gz
+sudo secure-backup-manager decrypt-local /path/backup /path/output.tar.gz
 sudo secure-backup-manager remote-key JOB_ID
 sudo secure-backup-manager delete
 sudo secure-backup-manager delete JOB_ID

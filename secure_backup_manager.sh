@@ -131,6 +131,7 @@ Uso:
   sudo ./${APP_NAME}.sh verify JOB_ID BACKUP_ID
   sudo ./${APP_NAME}.sh restore JOB_ID BACKUP_ID /ruta/destino
   sudo ./${APP_NAME}.sh decrypt JOB_ID BACKUP_ID /ruta/salida.tar.gz
+  sudo ./${APP_NAME}.sh decrypt-local /ruta/respaldo [/ruta/salida.tar.gz]
   sudo ./${APP_NAME}.sh remote-key JOB_ID
   sudo ./${APP_NAME}.sh remote-install-key JOB_ID
   sudo ./${APP_NAME}.sh remote-test JOB_ID
@@ -1077,12 +1078,170 @@ decrypt_backup() {
 
     verify_backup "$JOB_ID" "$backup_id"
     info "Descifrando $archive"
-    decrypt_archive_to_temp "$archive" "$output_path"
+    if ! decrypt_archive_to_temp "$archive" "$output_path"; then
+        die "No se pudo descifrar el respaldo. Revise la contrasena, el archivo y el log: $CURRENT_LOG"
+    fi
     ok "Archivo descifrado creado: $output_path"
     warn "El archivo descifrado contiene datos sensibles. Protejalo, muevalo a un lugar seguro o eliminelo cuando termine."
 }
 
-decrypt_backup_interactive() {
+default_decrypt_output_path() {
+    local archive="$1"
+    local output_name
+    output_name="$(basename "$archive")"
+    output_name="${output_name%.enc}"
+    printf '%s/%s\n' "${HOME:-/root}" "$output_name"
+}
+
+select_local_encrypted_archive() {
+    local backup_path="${1:-}"
+    [[ -n "$backup_path" ]] || die "Falta directorio o archivo de respaldo cifrado"
+
+    if [[ -f "$backup_path" ]]; then
+        [[ "$backup_path" == *.tar.gz.enc ]] || die "El archivo no parece un respaldo cifrado .tar.gz.enc: $backup_path"
+        echo "$backup_path"
+        return 0
+    fi
+
+    [[ -d "$backup_path" ]] || die "No existe el directorio de respaldo: $backup_path"
+
+    local archives=()
+    local archive manifest archive_name
+    manifest="${backup_path%/}/manifest.conf"
+    if [[ -f "$manifest" ]]; then
+        archive_name="$(manifest_value "$manifest" ARCHIVE)"
+        if [[ -n "$archive_name" && -f "${backup_path%/}/${archive_name}" && "$archive_name" == *.tar.gz.enc ]]; then
+            echo "${backup_path%/}/${archive_name}"
+            return 0
+        fi
+    fi
+
+    while IFS= read -r archive; do
+        archives+=("$archive")
+    done < <(find "$backup_path" -maxdepth 4 -type f -name '*.tar.gz.enc' 2>/dev/null | sort || true)
+
+    [[ ${#archives[@]} -gt 0 ]] || die "No se encontraron archivos .tar.gz.enc dentro de: $backup_path"
+    if [[ ${#archives[@]} -eq 1 ]]; then
+        echo "${archives[0]}"
+        return 0
+    fi
+
+    if [[ ! -t 0 ]]; then
+        warn "Se encontraron varios respaldos cifrados en $backup_path:"
+        printf '  %s\n' "${archives[@]}" >&2
+        die "Indique el archivo .tar.gz.enc exacto o use el menu interactivo"
+    fi
+
+    local index=1 backup_dir backup_id created_at backup_type cipher selected
+    echo "" >&2
+    echo "Respaldos cifrados encontrados / Encrypted backups found:" >&2
+    printf '%-4s %-28s %-12s %-25s %-16s %s\n' "#" "BACKUP_ID" "Tipo" "Fecha" "Cifrado" "Archivo" >&2
+    for archive in "${archives[@]}"; do
+        backup_dir="$(dirname "$archive")"
+        backup_id="$(basename "$backup_dir")"
+        manifest="${backup_dir}/manifest.conf"
+        created_at="$(manifest_value "$manifest" CREATED_AT)"
+        backup_type="$(manifest_value "$manifest" BACKUP_TYPE)"
+        cipher="$(manifest_value "$manifest" ENCRYPTION_CIPHER)"
+        created_at="${created_at:-$(backup_date_from_id "$backup_id")}"
+        backup_type="${backup_type:-unknown}"
+        cipher="${cipher:-aes-256-cbc}"
+        printf '%-4s %-28s %-12s %-25s %-16s %s\n' "$index" "$backup_id" "$backup_type" "$created_at" "$cipher" "$archive" >&2
+        ((++index))
+    done
+
+    selected="$(prompt_choice "Seleccione respaldo / Select backup" 1 "${#archives[@]}" 1)"
+    echo "${archives[$((selected - 1))]}"
+}
+
+verify_local_backup_dir() {
+    local backup_dir="$1"
+    local archive="$2"
+    local manifest="${backup_dir}/manifest.conf"
+    local hash_file="" hash_name candidate
+
+    if [[ -f "$manifest" ]]; then
+        hash_name="$(manifest_value "$manifest" SHA256_FILE)"
+        if [[ -n "$hash_name" && -f "${backup_dir}/${hash_name}" ]]; then
+            hash_file="${backup_dir}/${hash_name}"
+        fi
+    fi
+
+    if [[ -z "$hash_file" && -f "${archive}.sha256" ]]; then
+        hash_file="${archive}.sha256"
+    fi
+
+    if [[ -z "$hash_file" ]]; then
+        while IFS= read -r candidate; do
+            hash_file="$candidate"
+            break
+        done < <(find "$backup_dir" -maxdepth 1 -type f -name '*.sha256' 2>/dev/null | sort || true)
+    fi
+
+    if [[ -z "$hash_file" ]]; then
+        warn "No existe archivo SHA256 en $backup_dir; se descifrara sin verificacion de integridad."
+        return 0
+    fi
+
+    info "Verificando SHA256 local"
+    if ! (cd "$backup_dir" && sha256sum -c "$(basename "$hash_file")") >> "$CURRENT_LOG" 2>&1; then
+        die "Fallo la verificacion SHA256. Revise que el respaldo este completo: $backup_dir"
+    fi
+    ok "SHA256 verificado: $(basename "$hash_file")"
+}
+
+decrypt_local_archive() {
+    require_root
+    ensure_base_dirs
+
+    local archive="${1:-}"
+    local output_path="${2:-}"
+    [[ -n "$archive" ]] || die "Falta archivo .tar.gz.enc"
+    [[ -f "$archive" ]] || die "No existe archivo cifrado: $archive"
+    [[ "$archive" == *.tar.gz.enc ]] || die "El archivo no parece un respaldo cifrado .tar.gz.enc: $archive"
+
+    output_path="${output_path:-$(default_decrypt_output_path "$archive")}"
+    [[ -n "$output_path" ]] || die "Falta ruta de salida descifrada"
+
+    local backup_dir manifest cipher job_id backup_id output_dir log_id
+    backup_dir="$(dirname "$archive")"
+    manifest="${backup_dir}/manifest.conf"
+    cipher="$(manifest_value "$manifest" ENCRYPTION_CIPHER)"
+    ENCRYPTION_CIPHER="${cipher:-aes-256-cbc}"
+    job_id="$(manifest_value "$manifest" JOB_ID)"
+    backup_id="$(manifest_value "$manifest" BACKUP_ID)"
+    job_id="${job_id:-local}"
+    backup_id="${backup_id:-$(basename "$backup_dir")}"
+    log_id="$(safe_job_id "$job_id")"
+
+    output_dir="$(dirname "$output_path")"
+    mkdir -p "$output_dir"
+
+    CURRENT_LOG="${LOG_DIR}/${log_id}-decrypt-local-$(date +%Y%m%d-%H%M%S).log"
+    : > "$CURRENT_LOG"
+    chmod 640 "$CURRENT_LOG"
+
+    verify_local_backup_dir "$backup_dir" "$archive"
+    info "Descifrando respaldo local ${job_id}/${backup_id} con ${ENCRYPTION_CIPHER}"
+    if ! decrypt_archive_to_temp "$archive" "$output_path"; then
+        die "No se pudo descifrar el respaldo local. Revise la contrasena, el archivo y el log: $CURRENT_LOG"
+    fi
+    ok "Archivo descifrado creado: $output_path"
+    warn "El archivo descifrado contiene datos sensibles. Protejalo, muevalo a un lugar seguro o eliminelo cuando termine."
+    warn "Si el respaldo es incremental, descifrar este archivo no sustituye una restauracion completa de la cadena full + incrementales."
+}
+
+decrypt_local_backup() {
+    local backup_path="${1:-}"
+    local output_path="${2:-}"
+    local archive
+
+    archive="$(select_local_encrypted_archive "$backup_path")"
+    output_path="${output_path:-$(default_decrypt_output_path "$archive")}"
+    decrypt_local_archive "$archive" "$output_path"
+}
+
+decrypt_configured_backup_interactive() {
     local selected job_id backup_id default_output output_path
     selected="$(select_existing_backup "desencriptar" "true")"
     job_id="${selected%%|*}"
@@ -1090,6 +1249,41 @@ decrypt_backup_interactive() {
     default_output="/root/${job_id}-${backup_id}.tar.gz"
     output_path="$(prompt "$(t decrypt_path)" "$default_output")"
     decrypt_backup "$job_id" "$backup_id" "$output_path"
+}
+
+decrypt_local_backup_interactive() {
+    local backup_path archive default_output output_path
+    backup_path="$(prompt "Directorio o archivo del respaldo cifrado / Encrypted backup directory or file" "$(pwd)")"
+    archive="$(select_local_encrypted_archive "$backup_path")"
+    default_output="$(default_decrypt_output_path "$archive")"
+    output_path="$(prompt "$(t decrypt_path)" "$default_output")"
+    decrypt_local_archive "$archive" "$output_path"
+}
+
+decrypt_backup_interactive() {
+    local existing_count choice
+    existing_count="$(job_count)"
+
+    echo ""
+    echo "Desencriptar respaldo cifrado / Decrypt encrypted backup"
+    if [[ "$existing_count" -gt 0 ]]; then
+        echo "1) Seleccionar respaldo de trabajos configurados / Select configured backup"
+        echo "2) Escoger directorio o archivo local / Choose local directory or file"
+        echo "0) Volver / Back"
+        choice="$(prompt_choice "Opcion / Option" 0 2 2)"
+    else
+        warn "No hay trabajos configurados; puede descifrar desde un directorio local."
+        echo "1) Escoger directorio o archivo local / Choose local directory or file"
+        echo "0) Volver / Back"
+        choice="$(prompt_choice "Opcion / Option" 0 1 1)"
+        [[ "$choice" == "1" ]] && choice="2"
+    fi
+
+    case "$choice" in
+        1) decrypt_configured_backup_interactive ;;
+        2) decrypt_local_backup_interactive ;;
+        0) return 0 ;;
+    esac
 }
 
 run_backup_interactive() {
@@ -1197,7 +1391,9 @@ restore_backup() {
         if [[ "$archive" == *.enc ]]; then
             temp_archive="$(mktemp "/tmp/${APP_NAME}-${JOB_ID}-${item}.XXXXXX.tar.gz")"
             info "Descifrando respaldo temporalmente: $item"
-            decrypt_archive_to_temp "$archive" "$temp_archive"
+            if ! decrypt_archive_to_temp "$archive" "$temp_archive"; then
+                die "No se pudo descifrar $item. Revise la contrasena, el archivo y el log: $CURRENT_LOG"
+            fi
             restore_archive="$temp_archive"
         fi
         info "Extrayendo $item"
@@ -2000,6 +2196,7 @@ main() {
         verify) shift; [[ $# -gt 0 ]] && verify_backup "$@" || verify_backup_interactive ;;
         restore) shift; [[ $# -gt 0 ]] && restore_backup "$@" || restore_backup_interactive ;;
         decrypt) shift; [[ $# -gt 0 ]] && decrypt_backup "$@" || decrypt_backup_interactive ;;
+        decrypt-local|local-decrypt) shift; decrypt_local_backup "$@" ;;
         timers) shift; install_timers "$@" ;;
         remote-key) shift; generate_ssh_key "$@" ;;
         remote-install-key) shift; install_remote_key "$@" ;;
