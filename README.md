@@ -1,8 +1,8 @@
 # Secure Backup Manager
 
-**ES:** Gestor seguro de respaldos para Linux con programacion persistente, respaldos completos e incrementales, cifrado opcional con contrasena, verificacion SHA256, restauracion, envio remoto por SSH, logs y notificaciones por email.
+**ES:** Gestor seguro de respaldos para Linux con programacion persistente, respaldos completos e incrementales, cifrado opcional con contrasena, verificacion SHA256, restauracion, envio remoto por SSH, logs y notificaciones por Telegram.
 
-**EN:** Secure Linux backup manager with persistent scheduling, full and incremental backups, optional password-based encryption, SHA256 verification, restore workflow, SSH remote transfer, logs, and email notifications.
+**EN:** Secure Linux backup manager with persistent scheduling, full and incremental backups, optional password-based encryption, SHA256 verification, restore workflow, SSH remote transfer, logs, and Telegram notifications.
 
 **Elaborado por / Created by:** Alex Jesus Cabello Leiva  
 **Cargo / Role:** Lider de proyectos de innovacion y consultor en ciberseguridad / Innovation project leader and cybersecurity consultant
@@ -14,7 +14,7 @@
 - Interfaz interactiva en espanol e ingles.
 - Respaldos completos e incrementales.
 - Programacion diaria, semanal o mensual con `systemd timers`.
-- Persistencia tras reinicio con `Persistent=true`.
+- Persistencia tras reinicio con `Persistent=true`, recuperacion al arranque y reintentos acotados.
 - Respaldo de directorios.
 - Respaldo de PostgreSQL con `pg_dumpall` o `pg_dump`.
 - Respaldo de MySQL/MariaDB con `mysqldump`.
@@ -27,15 +27,16 @@
 - Restauracion de cadena full + incrementales.
 - Envio remoto con `rsync` sobre SSH usando llaves.
 - Logs en `/var/log/secure-backup-manager`.
-- Notificaciones por email con `mail`, `mailx` o `sendmail`.
+- Notificaciones por Telegram para chats privados, grupos, canales o topicos.
 - Eliminacion de trabajos con limpieza de timers.
+- Desinstalacion con limpieza de unidades systemd y estado persistente de timers.
 
 ## EN - Features
 
 - Interactive interface in Spanish and English.
 - Full and incremental backups.
 - Daily, weekly, or monthly scheduling with `systemd timers`.
-- Reboot persistence with `Persistent=true`.
+- Reboot persistence with `Persistent=true`, boot recovery, and bounded retries.
 - Directory backups.
 - PostgreSQL backups with `pg_dumpall` or `pg_dump`.
 - MySQL/MariaDB backups with `mysqldump`.
@@ -48,8 +49,9 @@
 - Full + incremental chain restore.
 - Remote transfer with `rsync` over SSH keys.
 - Logs in `/var/log/secure-backup-manager`.
-- Email notifications with `mail`, `mailx`, or `sendmail`.
+- Telegram notifications for private chats, groups, channels, or topics.
 - Job deletion with timer cleanup.
+- Uninstall workflow that cleans systemd units and persistent timer state.
 
 ---
 
@@ -66,9 +68,9 @@ Sistema Linux con:
 - OpenSSH client
 - OpenSSL
 - util-linux, para `flock`
+- curl, para notificaciones Telegram
 - PostgreSQL tools, si respaldara PostgreSQL
 - MySQL/MariaDB client tools, si respaldara MySQL/MariaDB
-- mailutils, mailx o sendmail, si usara email
 
 El instalador intenta instalar dependencias basicas usando `apt`, `dnf`, `yum`, `zypper` o `pacman`.
 
@@ -85,9 +87,9 @@ Linux system with:
 - OpenSSH client
 - OpenSSL
 - util-linux, for `flock`
+- curl, for Telegram notifications
 - PostgreSQL tools, if PostgreSQL will be backed up
 - MySQL/MariaDB client tools, if MySQL/MariaDB will be backed up
-- mailutils, mailx, or sendmail, if email notifications are used
 
 The installer tries to install basic dependencies using `apt`, `dnf`, `yum`, `zypper`, or `pacman`.
 
@@ -154,7 +156,7 @@ El asistente preguntara:
 - Frecuencia, dia y hora del respaldo incremental.
 - Frecuencia, dia y hora del respaldo completo.
 - Destino remoto por SSH, si aplica.
-- Email de notificaciones, si aplica.
+- Notificaciones Telegram, si aplica.
 - Si desea cifrar los respaldos con contrasena.
 
 Importante: si activa cifrado, la contrasena se guarda en un archivo protegido por root para que los respaldos programados puedan ejecutarse sin intervencion. Debe conservar una copia segura de esa contrasena para poder restaurar.
@@ -180,7 +182,7 @@ The wizard asks for:
 - Incremental backup frequency, day, and time.
 - Full backup frequency, day, and time.
 - SSH remote destination, if needed.
-- Notification email, if needed.
+- Telegram notifications, if needed.
 - Whether backups should be password-encrypted.
 
 Important: if encryption is enabled, the password is stored in a root-protected file so scheduled backups can run without interaction. You must keep a secure copy of that password to restore.
@@ -327,7 +329,7 @@ Ver un trabajo y su configuracion completa:
 sudo secure-backup-manager status JOB_ID
 ```
 
-La salida incluye rutas, retencion, base de datos, modo, calendarios, configuracion remota, SSH, email, cifrado, directorios, exclusiones, servicios, resumen de verificacion, estado de timers/servicios systemd y eventos recientes del journal.
+La salida incluye rutas, retencion, base de datos, modo, calendarios, configuracion remota, SSH, Telegram, cifrado, directorios, exclusiones, servicios, resumen de verificacion, estado de timers/servicios systemd y eventos recientes del journal.
 
 ## EN - Check jobs and configuration
 
@@ -343,7 +345,7 @@ Show one job and its full configuration:
 sudo secure-backup-manager status JOB_ID
 ```
 
-The output includes paths, retention, database, mode, schedules, remote setup, SSH, email, encryption, directories, exclusions, services, verification summary, systemd timer/service status, and recent journal events.
+The output includes paths, retention, database, mode, schedules, remote setup, SSH, Telegram, encryption, directories, exclusions, services, verification summary, systemd timer/service status, and recent journal events.
 
 ---
 
@@ -355,7 +357,7 @@ sudo secure-backup-manager list JOB_ID
 sudo secure-backup-manager verify JOB_ID BACKUP_ID
 ```
 
-`list` sin `JOB_ID` muestra todos los respaldos configurados con sus calendarios, directorios, email, cifrado, remoto, retencion y respaldos realizados. En el menu interactivo, el programa pausa despues de mostrar el listado para que pueda revisarse antes de volver al menu.
+`list` sin `JOB_ID` muestra todos los respaldos configurados con sus calendarios, directorios, Telegram, cifrado, remoto, retencion y respaldos realizados. En el menu interactivo, el programa pausa despues de mostrar el listado para que pueda revisarse antes de volver al menu.
 
 Ejemplo:
 
@@ -374,7 +376,7 @@ sudo secure-backup-manager list JOB_ID
 sudo secure-backup-manager verify JOB_ID BACKUP_ID
 ```
 
-`list` without `JOB_ID` shows all configured backup jobs with schedules, directories, email, encryption, remote settings, retention, and completed backups. In the interactive menu, the program pauses after showing the list so it can be reviewed before returning to the menu.
+`list` without `JOB_ID` shows all configured backup jobs with schedules, directories, Telegram, encryption, remote settings, retention, and completed backups. In the interactive menu, the program pauses after showing the list so it can be reviewed before returning to the menu.
 
 Example:
 
@@ -487,25 +489,125 @@ Warning: the decrypted `.tar.gz` contains the original data without encryption. 
 
 ---
 
-## ES - Notificaciones por email
+## ES - Notificaciones por Telegram
 
-Las notificaciones usan el sistema de correo local mediante `mail`, `mailx` o `sendmail`. Despues de configurar un email puede probarlo desde el menu con `Probar notificacion por email` o por consola:
+Las notificaciones usan la API HTTP de Telegram Bot con `curl`. El script envia mensajes de texto al `chat_id` configurado e incluye servidor, `JOB_ID`, tipo de respaldo, ruta local, fecha, log y ultimas lineas del log.
+
+Eventos notificados:
+
+- `STARTED`: el respaldo inicio.
+- `SUCCESS`: el respaldo termino correctamente.
+- `FAILED`: el respaldo fallo durante la ejecucion.
+- `REMOTE_FAILED`: el respaldo local termino, pero fallo la sincronizacion remota.
+- `INTERRUPTED`: el respaldo fue interrumpido por senal o reinicio.
+- `RECOVERY_STARTED`: el servicio de recuperacion al arranque relanzo un respaldo interrumpido.
+- `SERVICE_FAILED`: systemd marco fallida la unidad antes o despues de ejecutar el script.
+- `TIMER_MISSING` y `TIMER_REPAIRED`: se detectaron o repararon timers.
+
+Crear e integrar el bot:
+
+1. En Telegram, abra `@BotFather`.
+2. Ejecute `/newbot`, asigne nombre y usuario al bot.
+3. Copie el token entregado por BotFather.
+4. Para chat privado, envie `/start` o cualquier mensaje al bot.
+5. Para grupo, cree o use un grupo existente, agregue el bot y envie un mensaje en el grupo.
+6. Configure el job:
 
 ```bash
-sudo secure-backup-manager test-email JOB_ID
+sudo secure-backup-manager telegram-config JOB_ID
 ```
 
-Si la prueba indica que el mensaje fue aceptado pero no llega al buzon, revise el MTA local, el relay SMTP, spam y los logs del sistema de correo. El detalle del intento queda en `/var/log/secure-backup-manager`.
-
-## EN - Email Notifications
-
-Notifications use the local mail system through `mail`, `mailx`, or `sendmail`. After configuring an email address, test it from the menu with `Test email notification` or from the shell:
+El comando guarda el token en:
 
 ```bash
-sudo secure-backup-manager test-email JOB_ID
+/etc/secure-backup-manager/.secrets/telegram-bot.token
 ```
 
-If the test says the message was accepted but it does not reach the inbox, check the local MTA, SMTP relay, spam folder, and mail system logs. Attempt details are stored in `/var/log/secure-backup-manager`.
+con permisos `600`. Tambien puede indicar otro archivo si desea separar tokens por job.
+
+Obtener el `chat_id`:
+
+```bash
+sudo secure-backup-manager telegram-updates JOB_ID
+```
+
+Busque en la salida el objeto `"chat"` y el campo `"id"`. En grupos y supergrupos normalmente es un numero negativo. Si usa topicos de un supergrupo, puede configurar tambien `message_thread_id`.
+
+Probar:
+
+```bash
+sudo secure-backup-manager test-telegram JOB_ID
+```
+
+Para recibir notificaciones de varios servidores en el mismo Telegram, instale Secure Backup Manager en cada servidor y configure el mismo `TELEGRAM_BOT_TOKEN_FILE` o el mismo token, y el mismo `TELEGRAM_CHAT_ID`. Puede ser un chat privado, grupo, supergrupo o canal donde el bot tenga permiso para escribir. Los mensajes incluyen el hostname del servidor para distinguir el origen.
+
+Variables guardadas en el job:
+
+```bash
+TELEGRAM_ENABLED=true
+TELEGRAM_BOT_TOKEN_FILE=/etc/secure-backup-manager/.secrets/telegram-bot.token
+TELEGRAM_CHAT_ID=-1001234567890
+TELEGRAM_MESSAGE_THREAD_ID=
+TELEGRAM_SILENT=false
+TELEGRAM_INCLUDE_LOG=true
+TELEGRAM_LOG_LINES=30
+TELEGRAM_MAX_MESSAGE_CHARS=3900
+NOTIFY_START=true
+NOTIFY_SUCCESS=true
+NOTIFY_FAILURE=true
+```
+
+## EN - Telegram Notifications
+
+Notifications use the Telegram Bot HTTP API with `curl`. The script sends text messages to the configured `chat_id` and includes server, `JOB_ID`, backup type, local path, date, log path, and recent log lines.
+
+Notified events:
+
+- `STARTED`: the backup started.
+- `SUCCESS`: the backup finished successfully.
+- `FAILED`: the backup failed during execution.
+- `REMOTE_FAILED`: the local backup finished, but remote sync failed.
+- `INTERRUPTED`: the backup was interrupted by signal or reboot.
+- `RECOVERY_STARTED`: boot recovery relaunched an interrupted backup.
+- `SERVICE_FAILED`: systemd marked the unit as failed before or after running the script.
+- `TIMER_MISSING` and `TIMER_REPAIRED`: timers were detected as missing or repaired.
+
+Create and integrate the bot:
+
+1. In Telegram, open `@BotFather`.
+2. Run `/newbot`, then assign the bot name and username.
+3. Copy the token provided by BotFather.
+4. For a private chat, send `/start` or any message to the bot.
+5. For a group, create or use an existing group, add the bot, and send a message in the group.
+6. Configure the job:
+
+```bash
+sudo secure-backup-manager telegram-config JOB_ID
+```
+
+The command stores the token in:
+
+```bash
+/etc/secure-backup-manager/.secrets/telegram-bot.token
+```
+
+with `600` permissions. You can also provide another file if you want separate tokens per job.
+
+Get the `chat_id`:
+
+```bash
+sudo secure-backup-manager telegram-updates JOB_ID
+```
+
+Look for the `"chat"` object and the `"id"` field. Groups and supergroups usually use a negative number. If you use supergroup topics, you can also configure `message_thread_id`.
+
+Test:
+
+```bash
+sudo secure-backup-manager test-telegram JOB_ID
+```
+
+To receive notifications from several servers in the same Telegram destination, install Secure Backup Manager on each server and configure the same `TELEGRAM_BOT_TOKEN_FILE` or same token, and the same `TELEGRAM_CHAT_ID`. This can be a private chat, group, supergroup, or channel where the bot can write. Messages include the server hostname so the origin is clear.
 
 ---
 
@@ -660,9 +762,16 @@ Cada trabajo crea:
 ```text
 secure-backup-manager-JOB_ID-full.timer
 secure-backup-manager-JOB_ID-incremental.timer
+secure-backup-manager-JOB_ID-recovery.service
+secure-backup-manager-JOB_ID-full-failure.service
+secure-backup-manager-JOB_ID-incremental-failure.service
 ```
 
 Los timers se instalan en systemd con `Persistent=true`: si el equipo estaba apagado cuando paso la hora programada, systemd ejecuta el respaldo pendiente al iniciar nuevamente, una vez que el timer este activo. El script tambien usa `WakeSystem=true` para intentar despertar el equipo desde suspension si el hardware lo permite; no puede encender un equipo completamente apagado.
+
+Ademas, cada job habilita un servicio de recuperacion al arranque. Si un respaldo quedo interrumpido por reinicio, apagado abrupto o senal del sistema, el script deja una marca en `/etc/secure-backup-manager/state/JOB_ID.running`; al iniciar nuevamente, `secure-backup-manager-JOB_ID-recovery.service` detecta esa marca, notifica por Telegram y relanza el respaldo del mismo tipo.
+
+Los servicios de respaldo usan `Restart=on-failure` con `RestartSec=10min` y limite de 3 intentos por hora para tolerar fallos transitorios sin crear bucles infinitos. Tambien usan `OnFailure` para disparar una notificacion Telegram si systemd marca fallida la unidad, incluso cuando el respaldo no alcanzo a proceder correctamente.
 
 Reparar o reinstalar timers existentes:
 
@@ -690,9 +799,16 @@ Each job creates:
 ```text
 secure-backup-manager-JOB_ID-full.timer
 secure-backup-manager-JOB_ID-incremental.timer
+secure-backup-manager-JOB_ID-recovery.service
+secure-backup-manager-JOB_ID-full-failure.service
+secure-backup-manager-JOB_ID-incremental-failure.service
 ```
 
 Timers are installed in systemd with `Persistent=true`: if the machine was powered off when the scheduled time passed, systemd runs the missed backup on the next boot once the timer is active. The script also uses `WakeSystem=true` to try to wake from suspend when hardware supports it; it cannot power on a fully shut down machine.
+
+Each job also enables a boot recovery service. If a backup was interrupted by reboot, abrupt shutdown, or system signal, the script leaves a marker in `/etc/secure-backup-manager/state/JOB_ID.running`; on the next boot, `secure-backup-manager-JOB_ID-recovery.service` detects it, sends a Telegram notification, and relaunches the same backup type.
+
+Backup services use `Restart=on-failure` with `RestartSec=10min` and a limit of 3 attempts per hour to tolerate transient failures without creating infinite loops. They also use `OnFailure` to trigger a Telegram notification if systemd marks the unit as failed, including cases where the backup did not proceed correctly.
 
 Repair or reinstall existing timers:
 
@@ -779,6 +895,70 @@ When backups are deleted but jobs are kept, the program resets incremental state
 
 ---
 
+## ES - Desinstalacion
+
+Para retirar Secure Backup Manager del servidor:
+
+```bash
+sudo secure-backup-manager uninstall
+```
+
+La desinstalacion:
+
+- Deshabilita y detiene todas las unidades `secure-backup-manager-*`.
+- Elimina timers, servicios de respaldo, servicios de recuperacion y servicios de notificacion `OnFailure`.
+- Limpia el estado persistente de timers con `systemctl clean --what=state` cuando systemd lo soporta.
+- Elimina archivos de marca `.running`, `.interrupted` y `.failure-notified`.
+- Elimina el comando instalado en `/usr/local/sbin/secure-backup-manager`.
+- Conserva configuracion, secretos, logs y respaldos por defecto.
+
+Para automatizar sin pregunta interactiva:
+
+```bash
+sudo secure-backup-manager uninstall --yes
+```
+
+Para una limpieza completa de datos gestionados por la herramienta:
+
+```bash
+sudo secure-backup-manager uninstall --purge
+```
+
+`--purge` elimina `/etc/secure-backup-manager`, `/var/log/secure-backup-manager` y `/var/backups/secure-backup-manager`. Las rutas de respaldo personalizadas fuera de `/var/backups/secure-backup-manager` se conservan para evitar borrados accidentales.
+
+## EN - Uninstall
+
+To remove Secure Backup Manager from the server:
+
+```bash
+sudo secure-backup-manager uninstall
+```
+
+Uninstall:
+
+- Disables and stops all `secure-backup-manager-*` units.
+- Removes timers, backup services, recovery services, and `OnFailure` notification services.
+- Clears persistent timer state with `systemctl clean --what=state` when supported by systemd.
+- Removes `.running`, `.interrupted`, and `.failure-notified` marker files.
+- Removes the installed command at `/usr/local/sbin/secure-backup-manager`.
+- Keeps configuration, secrets, logs, and backups by default.
+
+For non-interactive automation:
+
+```bash
+sudo secure-backup-manager uninstall --yes
+```
+
+For a full cleanup of data managed by the tool:
+
+```bash
+sudo secure-backup-manager uninstall --purge
+```
+
+`--purge` removes `/etc/secure-backup-manager`, `/var/log/secure-backup-manager`, and `/var/backups/secure-backup-manager`. Custom backup paths outside `/var/backups/secure-backup-manager` are preserved to avoid accidental deletion.
+
+---
+
 ## ES - Estructura de archivos
 
 ```bash
@@ -786,7 +966,7 @@ When backups are deleted but jobs are kept, the program resets incremental state
 /etc/secure-backup-manager/jobs     # trabajos
 /etc/secure-backup-manager/state    # estado incremental
 /etc/secure-backup-manager/ssh      # llaves SSH
-/etc/secure-backup-manager/.secrets # contrasenas de cifrado protegidas por root
+/etc/secure-backup-manager/.secrets # contrasenas y token Telegram protegidos por root
 /var/backups/secure-backup-manager  # respaldos locales
 /var/log/secure-backup-manager      # logs
 ```
@@ -798,7 +978,7 @@ When backups are deleted but jobs are kept, the program resets incremental state
 /etc/secure-backup-manager/jobs     # jobs
 /etc/secure-backup-manager/state    # incremental state
 /etc/secure-backup-manager/ssh      # SSH keys
-/etc/secure-backup-manager/.secrets # root-protected encryption passwords
+/etc/secure-backup-manager/.secrets # root-protected encryption passwords and Telegram token
 /var/backups/secure-backup-manager  # local backups
 /var/log/secure-backup-manager      # logs
 ```
@@ -825,6 +1005,7 @@ Modelo de secretos:
 - Los secretos se guardan bajo `/etc/secure-backup-manager/.secrets`.
 - El directorio usa permisos `700`.
 - Los archivos de contrasena usan permisos `600`.
+- El token Telegram se guarda en un archivo `600` y no se escribe en el archivo del job.
 - El script fija `umask 077`.
 - Las contrasenas no se pasan a OpenSSL como argumentos visibles.
 - OpenSSL recibe la contrasena con `-pass file:...`.
@@ -851,6 +1032,7 @@ Secrets model:
 - Secrets are stored under `/etc/secure-backup-manager/.secrets`.
 - The directory uses `700` permissions.
 - Password files use `600` permissions.
+- The Telegram token is stored in a `600` file and is not written into the job file.
 - The script sets `umask 077`.
 - Passwords are not passed to OpenSSL as process-visible arguments.
 - OpenSSL receives passwords with `-pass file:...`.
@@ -875,10 +1057,14 @@ sudo secure-backup-manager verify JOB_ID BACKUP_ID
 sudo secure-backup-manager restore JOB_ID BACKUP_ID /ruta/destino
 sudo secure-backup-manager decrypt JOB_ID BACKUP_ID /ruta/salida.tar.gz
 sudo secure-backup-manager decrypt-local /ruta/respaldo /ruta/salida.tar.gz
-sudo secure-backup-manager test-email JOB_ID
+sudo secure-backup-manager telegram-config JOB_ID
+sudo secure-backup-manager telegram-updates JOB_ID
+sudo secure-backup-manager test-telegram JOB_ID
 sudo secure-backup-manager remote-key JOB_ID
 sudo secure-backup-manager delete
 sudo secure-backup-manager delete JOB_ID
+sudo secure-backup-manager uninstall
+sudo secure-backup-manager uninstall --yes
 ```
 
 ## EN - Quick commands
@@ -897,8 +1083,12 @@ sudo secure-backup-manager verify JOB_ID BACKUP_ID
 sudo secure-backup-manager restore JOB_ID BACKUP_ID /restore/path
 sudo secure-backup-manager decrypt JOB_ID BACKUP_ID /path/output.tar.gz
 sudo secure-backup-manager decrypt-local /path/backup /path/output.tar.gz
-sudo secure-backup-manager test-email JOB_ID
+sudo secure-backup-manager telegram-config JOB_ID
+sudo secure-backup-manager telegram-updates JOB_ID
+sudo secure-backup-manager test-telegram JOB_ID
 sudo secure-backup-manager remote-key JOB_ID
 sudo secure-backup-manager delete
 sudo secure-backup-manager delete JOB_ID
+sudo secure-backup-manager uninstall
+sudo secure-backup-manager uninstall --yes
 ```

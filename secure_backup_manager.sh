@@ -2,7 +2,7 @@
 #
 # Secure Backup Manager
 # Backups de directorios y bases de datos con systemd timers, SSH keys,
-# hashes SHA256, logs, notificaciones por email y restauracion.
+# hashes SHA256, logs, notificaciones por Telegram y restauracion.
 # Elaborado por: Alex Jesus Cabello Leiva
 # Lider de proyectos de innovacion y consultor en ciberseguridad.
 
@@ -10,7 +10,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="1.0.1"
+VERSION="1.1.0"
 APP_NAME="secure-backup-manager"
 CONFIG_DIR="/etc/${APP_NAME}"
 JOBS_DIR="${CONFIG_DIR}/jobs"
@@ -21,6 +21,11 @@ LOG_DIR="/var/log/${APP_NAME}"
 DEFAULT_BACKUP_ROOT="/var/backups/${APP_NAME}"
 RUN_DIR="/run/${APP_NAME}"
 SCRIPT_INSTALL_PATH="/usr/local/sbin/${APP_NAME}"
+SYSTEMD_SYSTEM_DIR="${SYSTEMD_SYSTEM_DIR:-/etc/systemd/system}"
+SYSTEMD_TIMER_STATE_DIR="${SYSTEMD_TIMER_STATE_DIR:-/var/lib/systemd/timers}"
+TELEGRAM_DEFAULT_TOKEN_FILE="${SECRETS_DIR}/telegram-bot.token"
+TELEGRAM_DEFAULT_LOG_LINES="30"
+TELEGRAM_DEFAULT_MAX_MESSAGE_CHARS="3900"
 TIMER_RANDOM_DELAY_SEC="${TIMER_RANDOM_DELAY_SEC:-0}"
 
 if [[ -t 1 ]]; then
@@ -37,10 +42,18 @@ fi
 
 CURRENT_LOG=""
 STOPPED_SERVICES=()
+SERVICES_CLEANED="false"
 APP_LANG="${APP_LANG:-es}"
 LANGUAGE_SELECTED="${LANGUAGE_SELECTED:-false}"
 SNAPSHOT_PATH=""
 SNAPSHOT_BACKUP=""
+RUN_STATE_FILE=""
+RUN_STATE_WRITTEN="false"
+BACKUP_COMPLETED="false"
+BACKUP_ERROR_LINE=""
+BACKUP_SIGNAL=""
+BACKUP_REQUESTED_TYPE=""
+BACKUP_EFFECTIVE_TYPE=""
 
 info() { echo -e "${C_CYAN}[*]${C_RESET} $*"; log "INFO" "$*"; }
 ok() { echo -e "${C_GREEN}[+]${C_RESET} $*"; log "INFO" "$*"; }
@@ -96,7 +109,9 @@ t() {
         ssh_key) [[ "$APP_LANG" == "en" ]] && echo "Show SSH public key" || echo "Mostrar llave publica SSH" ;;
         ssh_install) [[ "$APP_LANG" == "en" ]] && echo "Install SSH key on remote host" || echo "Instalar llave SSH en remoto" ;;
         delete_job) [[ "$APP_LANG" == "en" ]] && echo "Delete jobs/backups" || echo "Eliminar trabajos/respaldos" ;;
-        test_email) [[ "$APP_LANG" == "en" ]] && echo "Test email notification" || echo "Probar notificacion por email" ;;
+        telegram_config) [[ "$APP_LANG" == "en" ]] && echo "Configure Telegram notifications" || echo "Configurar notificaciones Telegram" ;;
+        test_telegram) [[ "$APP_LANG" == "en" ]] && echo "Test Telegram notification" || echo "Probar notificacion Telegram" ;;
+        uninstall) [[ "$APP_LANG" == "en" ]] && echo "Uninstall from server" || echo "Desinstalar del servidor" ;;
         language) [[ "$APP_LANG" == "en" ]] && echo "Language / Idioma" || echo "Idioma / Language" ;;
         exit) [[ "$APP_LANG" == "en" ]] && echo "Exit" || echo "Salir" ;;
         option) [[ "$APP_LANG" == "en" ]] && echo "Option" || echo "Opcion" ;;
@@ -141,9 +156,12 @@ Uso:
   sudo ${cli} remote-key JOB_ID
   sudo ${cli} remote-install-key JOB_ID
   sudo ${cli} remote-test JOB_ID
-  sudo ${cli} test-email JOB_ID
+  sudo ${cli} telegram-config JOB_ID
+  sudo ${cli} test-telegram JOB_ID
+  sudo ${cli} telegram-updates JOB_ID
   sudo ${cli} delete JOB_ID
   sudo ${cli} timers [JOB_ID]
+  sudo ${cli} uninstall [--yes] [--purge]
   sudo ${cli} menu
 
 Ejemplos de calendario systemd:
@@ -180,12 +198,9 @@ detect_pkg_manager() {
 install_packages() {
     local missing=()
     local cmd
-    for cmd in tar gzip sha256sum rsync ssh systemctl flock find awk sed date openssl; do
+    for cmd in tar gzip sha256sum rsync ssh systemctl flock find awk sed date openssl curl; do
         need_cmd "$cmd" || missing+=("$cmd")
     done
-    if ! need_cmd mail && ! need_cmd mailx && ! need_cmd sendmail; then
-        missing+=("mailutils/mailx/sendmail")
-    fi
 
     [[ ${#missing[@]} -eq 0 ]] && return 0
 
@@ -196,13 +211,13 @@ install_packages() {
     case "$pm" in
         apt)
             apt-get update
-            apt-get install -y tar gzip coreutils rsync openssh-client openssl systemd util-linux findutils gawk sed mailutils
+            apt-get install -y tar gzip coreutils rsync openssh-client openssl systemd util-linux findutils gawk sed curl
             ;;
-        dnf) dnf install -y tar gzip coreutils rsync openssh-clients openssl systemd util-linux findutils gawk sed mailx ;;
-        yum) yum install -y tar gzip coreutils rsync openssh-clients openssl systemd util-linux findutils gawk sed mailx ;;
-        zypper) zypper install -y tar gzip coreutils rsync openssh-clients openssl systemd util-linux findutils gawk sed mailx ;;
-        pacman) pacman -Sy --noconfirm tar gzip coreutils rsync openssh openssl systemd util-linux findutils gawk sed ;;
-        *) die "No se detecto gestor de paquetes. Instale manualmente: tar gzip coreutils rsync openssh-client openssl systemd util-linux" ;;
+        dnf) dnf install -y tar gzip coreutils rsync openssh-clients openssl systemd util-linux findutils gawk sed curl ;;
+        yum) yum install -y tar gzip coreutils rsync openssh-clients openssl systemd util-linux findutils gawk sed curl ;;
+        zypper) zypper install -y tar gzip coreutils rsync openssh-clients openssl systemd util-linux findutils gawk sed curl ;;
+        pacman) pacman -Sy --noconfirm tar gzip coreutils rsync openssh openssl systemd util-linux findutils gawk sed curl ;;
+        *) die "No se detecto gestor de paquetes. Instale manualmente: tar gzip coreutils rsync openssh-client openssl systemd util-linux curl" ;;
     esac
 }
 
@@ -264,7 +279,15 @@ load_job() {
     REMOTE_DEST="${REMOTE_DEST:-}"
     SSH_KEY="${SSH_KEY:-${KEY_DIR}/${JOB_ID}_ed25519}"
     SSH_PORT="${SSH_PORT:-22}"
-    EMAIL_TO="${EMAIL_TO:-}"
+    TELEGRAM_ENABLED="${TELEGRAM_ENABLED:-false}"
+    TELEGRAM_BOT_TOKEN_FILE="${TELEGRAM_BOT_TOKEN_FILE:-${TELEGRAM_DEFAULT_TOKEN_FILE}}"
+    TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+    TELEGRAM_MESSAGE_THREAD_ID="${TELEGRAM_MESSAGE_THREAD_ID:-}"
+    TELEGRAM_SILENT="${TELEGRAM_SILENT:-false}"
+    TELEGRAM_INCLUDE_LOG="${TELEGRAM_INCLUDE_LOG:-true}"
+    TELEGRAM_LOG_LINES="${TELEGRAM_LOG_LINES:-${TELEGRAM_DEFAULT_LOG_LINES}}"
+    TELEGRAM_MAX_MESSAGE_CHARS="${TELEGRAM_MAX_MESSAGE_CHARS:-${TELEGRAM_DEFAULT_MAX_MESSAGE_CHARS}}"
+    NOTIFY_START="${NOTIFY_START:-true}"
     NOTIFY_SUCCESS="${NOTIFY_SUCCESS:-true}"
     NOTIFY_FAILURE="${NOTIFY_FAILURE:-true}"
     ENCRYPTION_ENABLED="${ENCRYPTION_ENABLED:-false}"
@@ -282,63 +305,104 @@ read_list() {
     grep -Ev '^[[:space:]]*($|#)' "$file" || true
 }
 
-send_email() {
-    local subject="$1"
-    local body_file="$2"
-    local send_body="$body_file"
-    local temp_body=""
+host_label() {
+    hostname -f 2>/dev/null || hostname 2>/dev/null || echo "unknown-host"
+}
+
+read_secret_oneline() {
+    local secret_file="$1"
+    tr -d '\r\n' < "$secret_file"
+}
+
+telegram_message_limit() {
+    local max="${TELEGRAM_MAX_MESSAGE_CHARS:-${TELEGRAM_DEFAULT_MAX_MESSAGE_CHARS}}"
+    [[ "$max" =~ ^[0-9]+$ ]] || max="$TELEGRAM_DEFAULT_MAX_MESSAGE_CHARS"
+    [[ "$max" -gt 0 && "$max" -le 4096 ]] || max="$TELEGRAM_DEFAULT_MAX_MESSAGE_CHARS"
+    echo "$max"
+}
+
+truncate_telegram_message_file() {
+    local message_file="$1"
+    local max bytes keep temp_file
+    max="$(telegram_message_limit)"
+    bytes="$(wc -c < "$message_file" | awk '{print $1}')"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || return 0
+    [[ "$bytes" -le "$max" ]] && return 0
+
+    keep=$((max - 120))
+    [[ "$keep" -gt 500 ]] || keep=500
+    temp_file="$(mktemp "${RUN_DIR}/telegram-message.XXXXXX")"
+    chmod 600 "$temp_file"
+    {
+        echo "[Mensaje truncado. Se muestran las ultimas lineas.]"
+        tail -c "$keep" "$message_file"
+    } > "$temp_file"
+    mv "$temp_file" "$message_file"
+}
+
+send_telegram_text_file() {
+    local message_file="$1"
     local send_log="${CURRENT_LOG:-/dev/null}"
+    local token curl_config curl_response curl_rc=0 message_copy
 
-    if [[ -z "${EMAIL_TO:-}" ]]; then
-        warn "EMAIL_TO no esta configurado; se omite notificacion por email"
+    if [[ "${TELEGRAM_ENABLED:-false}" != "true" ]]; then
+        log "INFO" "Telegram no configurado; no se envia notificacion"
+        return 0
+    fi
+    if [[ -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+        warn "TELEGRAM_CHAT_ID no esta configurado; se omite notificacion Telegram"
         return 1
     fi
+    if [[ -z "${TELEGRAM_BOT_TOKEN_FILE:-}" || ! -r "$TELEGRAM_BOT_TOKEN_FILE" ]]; then
+        warn "No se puede leer TELEGRAM_BOT_TOKEN_FILE; se omite notificacion Telegram"
+        return 1
+    fi
+    need_cmd curl || { warn "curl no esta instalado; se omite notificacion Telegram"; return 1; }
+    [[ -f "$message_file" ]] || die "No existe mensaje Telegram: $message_file"
 
-    [[ -f "$body_file" ]] || die "No existe cuerpo de email: $body_file"
+    token="$(read_secret_oneline "$TELEGRAM_BOT_TOKEN_FILE")"
+    [[ -n "$token" ]] || { warn "El token Telegram esta vacio"; return 1; }
+
     mkdir -p "$RUN_DIR" 2>/dev/null || true
-    temp_body="$(mktemp "${RUN_DIR}/email-body.XXXXXX")"
-    chmod 600 "$temp_body"
-    cp "$body_file" "$temp_body"
-    send_body="$temp_body"
+    message_copy="$(mktemp "${RUN_DIR}/telegram-text.XXXXXX")"
+    curl_config="$(mktemp "${RUN_DIR}/telegram-curl.XXXXXX")"
+    curl_response="$(mktemp "${RUN_DIR}/telegram-response.XXXXXX")"
+    chmod 600 "$message_copy" "$curl_config" "$curl_response"
+    cp "$message_file" "$message_copy"
+    truncate_telegram_message_file "$message_copy"
 
-    log "INFO" "Sending email notification to ${EMAIL_TO}: ${subject}"
+    {
+        printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$token"
+        printf 'request = "POST"\n'
+        printf 'data-urlencode = "chat_id=%s"\n' "$TELEGRAM_CHAT_ID"
+        if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then
+            printf 'data-urlencode = "message_thread_id=%s"\n' "$TELEGRAM_MESSAGE_THREAD_ID"
+        fi
+        printf 'data-urlencode = "text@%s"\n' "$message_copy"
+        printf 'data-urlencode = "disable_notification=%s"\n' "${TELEGRAM_SILENT:-false}"
+    } > "$curl_config"
 
-    if need_cmd mail; then
-        if mail -s "$subject" "$EMAIL_TO" < "$send_body" >> "$send_log" 2>&1; then
-            rm -f "$temp_body"
-            log "INFO" "Email notification accepted by mail"
-            return 0
-        fi
-        rm -f "$temp_body"
-        warn "No se pudo enviar email con mail. Revise el MTA local o pruebe: sudo $0 test-email ${JOB_ID:-JOB_ID}"
-        return 1
-    elif need_cmd mailx; then
-        if mailx -s "$subject" "$EMAIL_TO" < "$send_body" >> "$send_log" 2>&1; then
-            rm -f "$temp_body"
-            log "INFO" "Email notification accepted by mailx"
-            return 0
-        fi
-        rm -f "$temp_body"
-        warn "No se pudo enviar email con mailx. Revise el MTA local o pruebe: sudo $0 test-email ${JOB_ID:-JOB_ID}"
-        return 1
-    elif need_cmd sendmail; then
-        if {
-            printf 'To: %s\n' "$EMAIL_TO"
-            printf 'Subject: %s\n\n' "$subject"
-            cat "$send_body"
-        } | sendmail -t >> "$send_log" 2>&1; then
-            rm -f "$temp_body"
-            log "INFO" "Email notification accepted by sendmail"
-            return 0
-        fi
-        rm -f "$temp_body"
-        warn "No se pudo enviar email con sendmail. Revise el MTA local o pruebe: sudo $0 test-email ${JOB_ID:-JOB_ID}"
-        return 1
+    log "INFO" "Sending Telegram notification to chat ${TELEGRAM_CHAT_ID}"
+    if curl --silent --show-error --max-time 20 --retry 2 --retry-delay 3 \
+        --config "$curl_config" > "$curl_response" 2>> "$send_log"; then
+        curl_rc=0
     else
-        rm -f "$temp_body"
-        warn "No hay mail/mailx/sendmail instalado; se omite notificacion"
-        return 1
+        curl_rc=$?
     fi
+
+    if [[ "$curl_rc" -eq 0 ]] && grep -q '"ok"[[:space:]]*:[[:space:]]*true' "$curl_response"; then
+        rm -f "$message_copy" "$curl_config" "$curl_response"
+        log "INFO" "Telegram notification accepted"
+        return 0
+    fi
+
+    {
+        echo "Telegram notification failed. curl_rc=${curl_rc}"
+        sed 's/[[:cntrl:]]//g' "$curl_response" 2>/dev/null || true
+    } >> "$send_log" 2>/dev/null || true
+    rm -f "$message_copy" "$curl_config" "$curl_response"
+    warn "No se pudo enviar notificacion Telegram. Revise token, chat_id, red y permisos del bot."
+    return 1
 }
 
 run_as_user() {
@@ -359,38 +423,161 @@ run_as_user() {
 notify_result() {
     local status="$1"
     local backup_id="${2:-}"
-    local subject
-    subject="[${APP_NAME}] ${status}: ${JOB_ID}"
-    [[ -n "$backup_id" ]] && subject="${subject} ${backup_id}"
+    local message_file
+    local notify_rc=0
 
     case "$status" in
+        STARTED) [[ "${NOTIFY_START:-true}" == "true" ]] || return 0 ;;
         SUCCESS) [[ "$NOTIFY_SUCCESS" == "true" ]] || return 0 ;;
+        TEST) ;;
         *) [[ "$NOTIFY_FAILURE" == "true" ]] || return 0 ;;
     esac
-    if [[ -z "${EMAIL_TO:-}" ]]; then
-        log "INFO" "EMAIL_TO no configurado; no se envia notificacion"
+
+    if [[ "${TELEGRAM_ENABLED:-false}" != "true" ]]; then
+        log "INFO" "Telegram no configurado; no se envia notificacion"
         return 0
     fi
 
-    if ! send_email "$subject" "$CURRENT_LOG"; then
-        log "ERROR" "Email notification failed for ${JOB_ID:-unknown} ${backup_id}"
+    mkdir -p "$RUN_DIR" 2>/dev/null || true
+    message_file="$(mktemp "${RUN_DIR}/telegram-notification.XXXXXX")"
+    chmod 600 "$message_file"
+    build_notification_message "$status" "$backup_id" > "$message_file"
+
+    if send_telegram_text_file "$message_file"; then
+        case "$status" in
+            SUCCESS|STARTED|TEST|TIMER_REPAIRED) ;;
+            *) record_failure_notification ;;
+        esac
+    else
+        log "ERROR" "Telegram notification failed for ${JOB_ID:-unknown} ${backup_id}"
+        notify_rc=1
     fi
+    rm -f "$message_file"
+    return "$notify_rc"
 }
 
 cleanup_services() {
     local svc
+    [[ "${SERVICES_CLEANED:-false}" == "true" ]] && return 0
+    SERVICES_CLEANED="true"
     if [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then
         for (( idx=${#STOPPED_SERVICES[@]}-1 ; idx>=0 ; idx-- )); do
             svc="${STOPPED_SERVICES[$idx]}"
             log "INFO" "Starting service after backup: $svc"
             systemctl start "$svc" >> "$CURRENT_LOG" 2>&1 || log "ERROR" "Failed to start service: $svc"
         done
+        STOPPED_SERVICES=()
     fi
 }
 
-on_error() {
-    local line="${1:-unknown}"
-    fail "Error en linea $line. Revise log: ${CURRENT_LOG:-sin log}"
+notification_title() {
+    local status="$1"
+    case "$status" in
+        STARTED) echo "RESPALDO INICIADO" ;;
+        SUCCESS) echo "RESPALDO COMPLETADO" ;;
+        REMOTE_FAILED) echo "RESPALDO LOCAL OK, REMOTO FALLO" ;;
+        FAILED) echo "RESPALDO FALLIDO" ;;
+        INTERRUPTED) echo "RESPALDO INTERRUMPIDO" ;;
+        RECOVERY_STARTED) echo "RECUPERACION AL ARRANQUE" ;;
+        SERVICE_FAILED) echo "SERVICIO SYSTEMD FALLO" ;;
+        TIMER_MISSING) echo "TIMER SYSTEMD FALTANTE" ;;
+        TIMER_REPAIRED) echo "TIMER SYSTEMD REPARADO" ;;
+        TEST) echo "PRUEBA TELEGRAM" ;;
+        *) echo "$status" ;;
+    esac
+}
+
+build_notification_message() {
+    local status="$1"
+    local backup_id="${2:-}"
+    local title host now log_lines
+    title="$(notification_title "$status")"
+    host="$(host_label)"
+    now="$(date -Is)"
+    log_lines="${TELEGRAM_LOG_LINES:-${TELEGRAM_DEFAULT_LOG_LINES}}"
+    [[ "$log_lines" =~ ^[0-9]+$ ]] || log_lines="$TELEGRAM_DEFAULT_LOG_LINES"
+
+    echo "[${APP_NAME}] ${title}"
+    echo "Servidor: ${host}"
+    echo "Job: ${JOB_ID:-unknown} (${JOB_NAME:-unknown})"
+    echo "Estado: ${status}"
+    echo "Backup: ${backup_id:-n/a}"
+    echo "Tipo solicitado: ${BACKUP_REQUESTED_TYPE:-n/a}"
+    echo "Tipo efectivo: ${BACKUP_EFFECTIVE_TYPE:-n/a}"
+    echo "Ruta local: ${BACKUP_ROOT:-n/a}"
+    echo "Fecha: ${now}"
+    echo "Log: ${CURRENT_LOG:-n/a}"
+    if [[ "${TELEGRAM_INCLUDE_LOG:-true}" == "true" && -n "${CURRENT_LOG:-}" && -f "$CURRENT_LOG" && "$log_lines" -gt 0 ]]; then
+        echo ""
+        echo "Ultimas lineas del log:"
+        tail -n "$log_lines" "$CURRENT_LOG" 2>/dev/null || true
+    fi
+}
+
+failure_notification_marker() {
+    local failure_type="${BACKUP_EFFECTIVE_TYPE:-${BACKUP_REQUESTED_TYPE:-unknown}}"
+    printf '%s/%s-%s.failure-notified\n' "$STATE_DIR" "${JOB_ID:-unknown}" "$failure_type"
+}
+
+record_failure_notification() {
+    local marker
+    marker="$(failure_notification_marker)"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    : > "$marker" 2>/dev/null || true
+    chmod 600 "$marker" 2>/dev/null || true
+}
+
+recent_failure_notification() {
+    local failure_type="$1"
+    local marker="${STATE_DIR}/${JOB_ID}-${failure_type}.failure-notified"
+    local now mtime
+    [[ -f "$marker" ]] || return 1
+    now="$(date +%s)"
+    mtime="$(stat -c %Y "$marker" 2>/dev/null || echo 0)"
+    [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+    (( now - mtime < 600 ))
+}
+
+running_state_path() {
+    printf '%s/%s.running\n' "$STATE_DIR" "$JOB_ID"
+}
+
+write_running_state() {
+    RUN_STATE_FILE="$(running_state_path)"
+    : > "$RUN_STATE_FILE"
+    write_var "$RUN_STATE_FILE" STATE_JOB_ID "$JOB_ID"
+    write_var "$RUN_STATE_FILE" STATE_JOB_NAME "$JOB_NAME"
+    write_var "$RUN_STATE_FILE" STATE_BACKUP_ID "${BACKUP_ID:-}"
+    write_var "$RUN_STATE_FILE" STATE_REQUESTED_TYPE "${BACKUP_REQUESTED_TYPE:-}"
+    write_var "$RUN_STATE_FILE" STATE_EFFECTIVE_TYPE "${BACKUP_EFFECTIVE_TYPE:-}"
+    write_var "$RUN_STATE_FILE" STATE_STARTED_AT "$(date -Is)"
+    write_var "$RUN_STATE_FILE" STATE_HOSTNAME "$(host_label)"
+    write_var "$RUN_STATE_FILE" STATE_PID "$$"
+    chmod 600 "$RUN_STATE_FILE"
+    RUN_STATE_WRITTEN="true"
+}
+
+clear_running_state() {
+    [[ "${RUN_STATE_WRITTEN:-false}" == "true" ]] || return 0
+    [[ -n "${RUN_STATE_FILE:-}" ]] && rm -f "$RUN_STATE_FILE"
+    rm -f "${STATE_DIR}/${JOB_ID}.interrupted" 2>/dev/null || true
+    RUN_STATE_WRITTEN="false"
+}
+
+mark_interrupted_state() {
+    local signal_name="${1:-unknown}"
+    local interrupted_file="${STATE_DIR}/${JOB_ID}.interrupted"
+    : > "$interrupted_file"
+    write_var "$interrupted_file" STATE_JOB_ID "$JOB_ID"
+    write_var "$interrupted_file" STATE_BACKUP_ID "${BACKUP_ID:-}"
+    write_var "$interrupted_file" STATE_REQUESTED_TYPE "${BACKUP_REQUESTED_TYPE:-}"
+    write_var "$interrupted_file" STATE_EFFECTIVE_TYPE "${BACKUP_EFFECTIVE_TYPE:-}"
+    write_var "$interrupted_file" STATE_INTERRUPTED_AT "$(date -Is)"
+    write_var "$interrupted_file" STATE_SIGNAL "$signal_name"
+    chmod 600 "$interrupted_file"
+}
+
+restore_incremental_snapshot_after_failure() {
     if [[ -n "${SNAPSHOT_PATH:-}" ]]; then
         if [[ -n "${SNAPSHOT_BACKUP:-}" && -f "$SNAPSHOT_BACKUP" ]]; then
             cp "$SNAPSHOT_BACKUP" "$SNAPSHOT_PATH" 2>/dev/null || true
@@ -400,10 +587,39 @@ on_error() {
             log "WARN" "Partial incremental snapshot removed after failed backup"
         fi
     fi
-    cleanup_services
-    if [[ -n "${JOB_ID:-}" && -n "${CURRENT_LOG:-}" ]]; then
-        notify_result "FAILED" "${BACKUP_ID:-}"
+}
+
+on_error() {
+    BACKUP_ERROR_LINE="${1:-unknown}"
+}
+
+on_backup_signal() {
+    BACKUP_SIGNAL="${1:-unknown}"
+    log "ERROR" "Backup interrupted by signal ${BACKUP_SIGNAL}"
+    exit 128
+}
+
+on_backup_exit() {
+    local exit_code="${1:-0}"
+    local line_msg=""
+    trap - ERR EXIT TERM INT HUP
+
+    if [[ "$exit_code" -ne 0 && "${BACKUP_COMPLETED:-false}" != "true" && -n "${JOB_ID:-}" && -n "${CURRENT_LOG:-}" ]]; then
+        if [[ -n "${BACKUP_SIGNAL:-}" ]]; then
+            fail "Respaldo interrumpido por senal ${BACKUP_SIGNAL}. Se reintentara en el proximo arranque si el servicio de recuperacion esta habilitado."
+            mark_interrupted_state "$BACKUP_SIGNAL"
+            cleanup_services
+            notify_result "INTERRUPTED" "${BACKUP_ID:-}" || true
+        else
+            [[ -n "${BACKUP_ERROR_LINE:-}" ]] && line_msg=" en linea ${BACKUP_ERROR_LINE}"
+            fail "Respaldo fallo${line_msg}. Revise log: ${CURRENT_LOG:-sin log}"
+            restore_incremental_snapshot_after_failure
+            cleanup_services
+            notify_result "FAILED" "${BACKUP_ID:-}" || true
+            clear_running_state
+        fi
     fi
+    return 0
 }
 
 stop_configured_services() {
@@ -540,6 +756,19 @@ prompt_password_once() {
     echo ""
     [[ -n "$pass" ]] || die "La contrasena no puede estar vacia / Password cannot be empty"
     printf '%s' "$pass"
+}
+
+prompt_secret_once() {
+    local label="$1"
+    local secret
+    read -r -s -p "${label}: " secret
+    echo ""
+    [[ -n "$secret" ]] || die "El valor no puede estar vacio / Value cannot be empty"
+    printf '%s' "$secret"
+}
+
+bool_prompt_default() {
+    [[ "${1:-false}" == "true" ]] && echo "s" || echo "n"
 }
 
 write_temp_secret_file() {
@@ -841,9 +1070,20 @@ run_backup() {
     CURRENT_LOG="${LOG_DIR}/${JOB_ID}-${BACKUP_ID}.log"
     : > "$CURRENT_LOG"
     chmod 640 "$CURRENT_LOG"
+    SERVICES_CLEANED="false"
+    RUN_STATE_FILE="$(running_state_path)"
+    RUN_STATE_WRITTEN="false"
+    BACKUP_COMPLETED="false"
+    BACKUP_ERROR_LINE=""
+    BACKUP_SIGNAL=""
+    BACKUP_REQUESTED_TYPE="$requested_type"
+    BACKUP_EFFECTIVE_TYPE="$requested_type"
 
     trap 'on_error $LINENO' ERR
-    trap cleanup_services EXIT
+    trap 'on_backup_exit $?' EXIT
+    trap 'on_backup_signal TERM' TERM
+    trap 'on_backup_signal INT' INT
+    trap 'on_backup_signal HUP' HUP
 
     exec 9>"${RUN_DIR}/${JOB_ID}.lock"
     flock -n 9 || die "Ya hay un respaldo ejecutandose para $JOB_ID"
@@ -868,6 +1108,8 @@ run_backup() {
         backup_type="full"
         BACKUP_ID="${BACKUP_ID/incremental/full}"
     fi
+    BACKUP_EFFECTIVE_TYPE="$backup_type"
+    write_running_state
 
     local chain_id
     if [[ "$backup_type" == "full" ]]; then
@@ -891,6 +1133,7 @@ run_backup() {
     chmod 700 "$backup_dir" "$work_dir"
 
     info "Iniciando respaldo $backup_type para $JOB_ID"
+    notify_result "STARTED" "$BACKUP_ID" || true
 
     if [[ "$DB_MODE" == "logical" ]]; then
         create_db_dumps "$dump_dir"
@@ -908,6 +1151,7 @@ run_backup() {
 
     info "Creando archivo tar.gz"
     create_backup_archive "$archive" "$snapshot" "$file_list" "$work_dir" "$dump_dir"
+    cleanup_services
 
     archive="$(encrypt_archive "$archive")"
     hash_file="${archive}.sha256"
@@ -932,11 +1176,14 @@ run_backup() {
     SNAPSHOT_BACKUP=""
 
     ok "Respaldo local completado: $backup_dir"
+    BACKUP_COMPLETED="true"
+    clear_running_state
     if [[ "$remote_status" == "failed" ]]; then
-        notify_result "REMOTE_FAILED" "$BACKUP_ID"
+        notify_result "REMOTE_FAILED" "$BACKUP_ID" || true
     else
-        notify_result "SUCCESS" "$BACKUP_ID"
+        notify_result "SUCCESS" "$BACKUP_ID" || true
     fi
+    trap - ERR EXIT TERM INT HUP
 }
 
 list_jobs() {
@@ -1528,26 +1775,149 @@ verify_systemd_units() {
     rm -f "$verify_log"
 }
 
+repair_job_timers_if_needed() {
+    local repaired=0 missing=0
+    local timer_unit unit_path recovery_unit
+    local timer_units=(
+        "${APP_NAME}-${JOB_ID}-full.timer"
+        "${APP_NAME}-${JOB_ID}-incremental.timer"
+    )
+
+    need_cmd systemctl || return 0
+
+    for timer_unit in "${timer_units[@]}"; do
+        unit_path="${SYSTEMD_SYSTEM_DIR}/${timer_unit}"
+        [[ -f "$unit_path" ]] || missing=1
+    done
+
+    if [[ "$missing" -eq 1 ]]; then
+        warn "Faltan timers systemd para $JOB_ID; se reinstalaran"
+        BACKUP_REQUESTED_TYPE="timer-check"
+        BACKUP_EFFECTIVE_TYPE="timer-check"
+        notify_result "TIMER_MISSING" "" || true
+        install_timers "$JOB_ID"
+        notify_result "TIMER_REPAIRED" "" || true
+        return 0
+    fi
+
+    for timer_unit in "${timer_units[@]}"; do
+        if ! systemctl is-enabled --quiet "$timer_unit"; then
+            systemctl enable "$timer_unit" >/dev/null 2>&1 || true
+            repaired=1
+        fi
+        if ! systemctl is-active --quiet "$timer_unit"; then
+            systemctl start "$timer_unit" >/dev/null 2>&1 || true
+            repaired=1
+        fi
+    done
+
+    recovery_unit="${APP_NAME}-${JOB_ID}-recovery.service"
+    if [[ -f "${SYSTEMD_SYSTEM_DIR}/${recovery_unit}" ]] && ! systemctl is-enabled --quiet "$recovery_unit"; then
+        systemctl enable "$recovery_unit" >/dev/null 2>&1 || true
+        repaired=1
+    fi
+
+    if [[ "$repaired" -eq 1 ]]; then
+        BACKUP_REQUESTED_TYPE="timer-check"
+        BACKUP_EFFECTIVE_TYPE="timer-check"
+        notify_result "TIMER_REPAIRED" "" || true
+    fi
+}
+
+recover_job() {
+    require_root
+    local job_id="${1:-}"
+    local state_file recover_type state_backup_id
+    local STATE_JOB_ID="" STATE_BACKUP_ID="" STATE_REQUESTED_TYPE="" STATE_EFFECTIVE_TYPE="" STATE_STARTED_AT="" STATE_HOSTNAME="" STATE_PID=""
+
+    load_job "$job_id"
+    ensure_base_dirs
+    CURRENT_LOG="${LOG_DIR}/${JOB_ID}-recovery-$(date +%Y%m%d-%H%M%S).log"
+    : > "$CURRENT_LOG"
+    chmod 640 "$CURRENT_LOG"
+
+    log "INFO" "Recovery check started for ${JOB_ID}"
+    repair_job_timers_if_needed
+
+    state_file="$(running_state_path)"
+    if [[ ! -f "$state_file" ]]; then
+        ok "No hay respaldo interrumpido para $JOB_ID"
+        return 0
+    fi
+
+    # shellcheck disable=SC1090
+    source "$state_file"
+    recover_type="${STATE_EFFECTIVE_TYPE:-${STATE_REQUESTED_TYPE:-incremental}}"
+    state_backup_id="${STATE_BACKUP_ID:-}"
+    [[ "$recover_type" == "full" || "$recover_type" == "incremental" ]] || recover_type="incremental"
+
+    warn "Se detecto respaldo interrumpido para $JOB_ID; se reintentara tipo ${recover_type}"
+    BACKUP_ID="$state_backup_id"
+    BACKUP_REQUESTED_TYPE="$recover_type"
+    BACKUP_EFFECTIVE_TYPE="$recover_type"
+    notify_result "RECOVERY_STARTED" "${state_backup_id:-}" || true
+    rm -f "$state_file" "${STATE_DIR}/${JOB_ID}.interrupted" 2>/dev/null || true
+    RUN_STATE_WRITTEN="false"
+    run_backup "$JOB_ID" "$recover_type"
+}
+
+systemd_failure_notify() {
+    require_root
+    local job_id="${1:-}"
+    local failed_type="${2:-unknown}"
+    local failed_unit="${3:-${APP_NAME}-${job_id}-${failed_type}.service}"
+
+    load_job "$job_id"
+    ensure_base_dirs
+    CURRENT_LOG="${LOG_DIR}/${JOB_ID}-systemd-failure-${failed_type}-$(date +%Y%m%d-%H%M%S).log"
+    : > "$CURRENT_LOG"
+    chmod 640 "$CURRENT_LOG"
+    BACKUP_REQUESTED_TYPE="$failed_type"
+    BACKUP_EFFECTIVE_TYPE="$failed_type"
+    BACKUP_ID=""
+
+    {
+        echo "Fallo systemd detectado para ${failed_unit}"
+        echo "JOB_ID=$JOB_ID"
+        echo "TIPO=$failed_type"
+        echo "FECHA=$(date -Is)"
+        echo ""
+    } >> "$CURRENT_LOG"
+    systemctl status "$failed_unit" --no-pager >> "$CURRENT_LOG" 2>&1 || true
+
+    if recent_failure_notification "$failed_type"; then
+        log "INFO" "Failure notification already sent recently for ${JOB_ID}/${failed_type}; skipping OnFailure duplicate"
+        return 0
+    fi
+    notify_result "SERVICE_FAILED" "" || true
+}
+
 install_timers() {
     require_root
     local job_id="${1:-}"
     load_job "$job_id"
 
-    local full_service="/etc/systemd/system/${APP_NAME}-${JOB_ID}-full.service"
-    local full_timer="/etc/systemd/system/${APP_NAME}-${JOB_ID}-full.timer"
-    local inc_service="/etc/systemd/system/${APP_NAME}-${JOB_ID}-incremental.service"
-    local inc_timer="/etc/systemd/system/${APP_NAME}-${JOB_ID}-incremental.timer"
+    local full_service="${SYSTEMD_SYSTEM_DIR}/${APP_NAME}-${JOB_ID}-full.service"
+    local full_timer="${SYSTEMD_SYSTEM_DIR}/${APP_NAME}-${JOB_ID}-full.timer"
+    local inc_service="${SYSTEMD_SYSTEM_DIR}/${APP_NAME}-${JOB_ID}-incremental.service"
+    local inc_timer="${SYSTEMD_SYSTEM_DIR}/${APP_NAME}-${JOB_ID}-incremental.timer"
+    local recovery_service="${SYSTEMD_SYSTEM_DIR}/${APP_NAME}-${JOB_ID}-recovery.service"
+    local full_failure_service="${SYSTEMD_SYSTEM_DIR}/${APP_NAME}-${JOB_ID}-full-failure.service"
+    local inc_failure_service="${SYSTEMD_SYSTEM_DIR}/${APP_NAME}-${JOB_ID}-incremental-failure.service"
     local runner
     validate_systemd_calendar "full" "$FULL_CALENDAR"
     validate_systemd_calendar "incremental" "$INCREMENTAL_CALENDAR"
     runner="$(ensure_timer_runner)"
 
-    cat > "$full_service" <<EOF
+cat > "$full_service" <<EOF
 [Unit]
 Description=Full backup ${JOB_ID}
-Wants=network-online.target
-After=local-fs.target network-online.target
+Wants=network-online.target time-sync.target
+After=local-fs.target network-online.target time-sync.target
 ConditionPathExists=${JOB_FILE}
+OnFailure=${APP_NAME}-${JOB_ID}-full-failure.service
+StartLimitIntervalSec=1h
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
@@ -1556,8 +1926,11 @@ Group=root
 WorkingDirectory=/
 UMask=0077
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=SBM_SYSTEMD_JOB_TYPE=full
 ExecStart=${runner} run ${JOB_ID} full
 TimeoutStartSec=0
+Restart=on-failure
+RestartSec=10min
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
@@ -1565,12 +1938,15 @@ StandardOutput=journal
 StandardError=journal
 EOF
 
-    cat > "$inc_service" <<EOF
+cat > "$inc_service" <<EOF
 [Unit]
 Description=Incremental backup ${JOB_ID}
-Wants=network-online.target
-After=local-fs.target network-online.target
+Wants=network-online.target time-sync.target
+After=local-fs.target network-online.target time-sync.target
 ConditionPathExists=${JOB_FILE}
+OnFailure=${APP_NAME}-${JOB_ID}-incremental-failure.service
+StartLimitIntervalSec=1h
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
@@ -1579,8 +1955,11 @@ Group=root
 WorkingDirectory=/
 UMask=0077
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=SBM_SYSTEMD_JOB_TYPE=incremental
 ExecStart=${runner} run ${JOB_ID} incremental
 TimeoutStartSec=0
+Restart=on-failure
+RestartSec=10min
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
@@ -1620,15 +1999,83 @@ Unit=${APP_NAME}-${JOB_ID}-incremental.service
 WantedBy=timers.target
 EOF
 
-    verify_systemd_units "$full_service" "$inc_service" "$full_timer" "$inc_timer"
+    cat > "$recovery_service" <<EOF
+[Unit]
+Description=Recovery check backup ${JOB_ID}
+Wants=network-online.target time-sync.target
+After=local-fs.target network-online.target time-sync.target
+ConditionPathExists=${JOB_FILE}
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/
+UMask=0077
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=${runner} recover ${JOB_ID}
+TimeoutStartSec=0
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > "$full_failure_service" <<EOF
+[Unit]
+Description=Notify failed full backup ${JOB_ID}
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=${JOB_FILE}
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/
+UMask=0077
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=${runner} systemd-failure ${JOB_ID} full ${APP_NAME}-${JOB_ID}-full.service
+TimeoutStartSec=5min
+StandardOutput=journal
+StandardError=journal
+EOF
+
+    cat > "$inc_failure_service" <<EOF
+[Unit]
+Description=Notify failed incremental backup ${JOB_ID}
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=${JOB_FILE}
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/
+UMask=0077
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=${runner} systemd-failure ${JOB_ID} incremental ${APP_NAME}-${JOB_ID}-incremental.service
+TimeoutStartSec=5min
+StandardOutput=journal
+StandardError=journal
+EOF
+
+    verify_systemd_units "$full_service" "$inc_service" "$full_timer" "$inc_timer" "$recovery_service" "$full_failure_service" "$inc_failure_service"
     systemctl daemon-reload
     systemctl enable --now "${APP_NAME}-${JOB_ID}-full.timer" "${APP_NAME}-${JOB_ID}-incremental.timer"
+    systemctl enable "${APP_NAME}-${JOB_ID}-recovery.service" >/dev/null 2>&1 || die "No se pudo habilitar servicio de recuperacion"
     local timer_unit
     for timer_unit in "${APP_NAME}-${JOB_ID}-full.timer" "${APP_NAME}-${JOB_ID}-incremental.timer"; do
         systemctl is-enabled --quiet "$timer_unit" || die "El timer no quedo habilitado: $timer_unit"
         systemctl is-active --quiet "$timer_unit" || die "El timer no quedo activo: $timer_unit"
     done
-    ok "Timers instalados y persistentes para $JOB_ID"
+    systemctl is-enabled --quiet "${APP_NAME}-${JOB_ID}-recovery.service" || die "El servicio de recuperacion no quedo habilitado"
+    ok "Timers y recuperacion al arranque instalados para $JOB_ID"
     systemctl list-timers --all "${APP_NAME}-${JOB_ID}-*.timer" --no-pager 2>/dev/null || true
 }
 
@@ -1644,20 +2091,149 @@ remove_timers() {
         "${APP_NAME}-${safe_id}-incremental.timer"
         "${APP_NAME}-${safe_id}-full.service"
         "${APP_NAME}-${safe_id}-incremental.service"
+        "${APP_NAME}-${safe_id}-recovery.service"
+        "${APP_NAME}-${safe_id}-full-failure.service"
+        "${APP_NAME}-${safe_id}-incremental-failure.service"
     )
     local unit path
 
     for unit in "${units[@]}"; do
         systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        if [[ "$unit" == *.timer ]]; then
+            clean_timer_persistence "$unit"
+        fi
     done
 
     for unit in "${units[@]}"; do
-        path="/etc/systemd/system/${unit}"
+        path="${SYSTEMD_SYSTEM_DIR}/${unit}"
         [[ -f "$path" ]] && rm -f "$path"
     done
 
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl reset-failed >/dev/null 2>&1 || true
+}
+
+clean_timer_persistence() {
+    local timer_unit="$1"
+    local stamp_file="${SYSTEMD_TIMER_STATE_DIR}/stamp-${timer_unit}"
+
+    if need_cmd systemctl; then
+        systemctl clean --what=state "$timer_unit" >/dev/null 2>&1 || true
+    fi
+
+    [[ -f "$stamp_file" ]] && rm -f "$stamp_file"
+}
+
+app_systemd_unit_files() {
+    local unit_file
+    shopt -s nullglob
+    for unit_file in "${SYSTEMD_SYSTEM_DIR}/${APP_NAME}-"*.timer "${SYSTEMD_SYSTEM_DIR}/${APP_NAME}-"*.service; do
+        [[ -f "$unit_file" ]] && printf '%s\n' "$unit_file"
+    done
+}
+
+remove_all_app_systemd_units() {
+    require_root
+    local unit path unit_file
+    local units=()
+    local -A seen=()
+
+    if need_cmd systemctl; then
+        while IFS= read -r unit; do
+            [[ -n "$unit" ]] && units+=("$unit")
+        done < <(systemctl list-unit-files "${APP_NAME}-*.timer" "${APP_NAME}-*.service" --no-legend --no-pager 2>/dev/null | awk '{print $1}' || true)
+    fi
+
+    while IFS= read -r unit_file; do
+        units+=("$(basename "$unit_file")")
+    done < <(app_systemd_unit_files)
+
+    for unit in "${units[@]}"; do
+        [[ -n "${seen[$unit]:-}" ]] && continue
+        seen[$unit]=1
+        case "$unit" in
+            "${APP_NAME}-"*.timer|"${APP_NAME}-"*.service) ;;
+            *) continue ;;
+        esac
+        if need_cmd systemctl; then
+            systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        fi
+        if [[ "$unit" == *.timer ]]; then
+            clean_timer_persistence "$unit"
+        fi
+    done
+
+    while IFS= read -r path; do
+        rm -f "$path"
+    done < <(app_systemd_unit_files)
+
+    if need_cmd systemctl; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed >/dev/null 2>&1 || true
+    fi
+}
+
+remove_runtime_persistence() {
+    shopt -s nullglob
+    if [[ -d "$STATE_DIR" ]]; then
+        rm -f "${STATE_DIR}/"*.running "${STATE_DIR}/"*.interrupted "${STATE_DIR}/"*.failure-notified
+    fi
+    if [[ -d "$RUN_DIR" ]]; then
+        rm -f "${RUN_DIR}/"*.lock "${RUN_DIR}/telegram-"* "${RUN_DIR}/secret."* "${RUN_DIR}/job-conf."*
+        rmdir "$RUN_DIR" 2>/dev/null || true
+    fi
+}
+
+uninstall_manager() {
+    require_root
+    local assume_yes="false"
+    local purge="false"
+    local arg
+
+    for arg in "$@"; do
+        case "$arg" in
+            --yes|-y) assume_yes="true" ;;
+            --purge) purge="true" ;;
+            *) die "Opcion invalida para uninstall: $arg" ;;
+        esac
+    done
+
+    echo "Desinstalacion / Uninstall: ${APP_NAME}"
+    echo "Se deshabilitaran timers, servicios, recuperacion al arranque y estado persistente de systemd."
+    echo "Backups, configuracion, logs y secretos se conservaran salvo que use --purge."
+    if [[ "$assume_yes" != "true" ]]; then
+        if ! prompt_yes_no "Continuar? / Continue? (s/n, y/n)" "n"; then
+            warn "Cancelado / Cancelled"
+            return 0
+        fi
+    fi
+
+    remove_all_app_systemd_units
+    remove_runtime_persistence
+
+    if [[ -f "$SCRIPT_INSTALL_PATH" ]]; then
+        rm -f "$SCRIPT_INSTALL_PATH"
+        ok "Comando instalado eliminado / Installed command removed: $SCRIPT_INSTALL_PATH"
+    fi
+
+    if [[ "$purge" == "true" ]]; then
+        if [[ "$assume_yes" != "true" ]]; then
+            warn "Modo --purge elimina configuracion, secretos, logs y respaldos dentro de ${DEFAULT_BACKUP_ROOT}."
+            if ! prompt_yes_no "Eliminar datos gestionados tambien? / Delete managed data too? (s/n, y/n)" "n"; then
+                purge="false"
+            fi
+        fi
+        if [[ "$purge" == "true" ]]; then
+            [[ -d "$CONFIG_DIR" && "$CONFIG_DIR" == /etc/"$APP_NAME" ]] && rm -rf "$CONFIG_DIR"
+            [[ -d "$LOG_DIR" && "$LOG_DIR" == /var/log/"$APP_NAME" ]] && rm -rf "$LOG_DIR"
+            [[ -d "$DEFAULT_BACKUP_ROOT" && "$DEFAULT_BACKUP_ROOT" == /var/backups/"$APP_NAME" ]] && rm -rf "$DEFAULT_BACKUP_ROOT"
+            ok "Datos gestionados eliminados / Managed data removed"
+        fi
+    else
+        ok "Configuracion, secretos, logs y respaldos conservados."
+    fi
+
+    ok "Desinstalacion completada; no quedan unidades systemd ni estado persistente gestionado por ${APP_NAME}."
 }
 
 install_all_timers() {
@@ -1680,18 +2256,21 @@ print_systemd_job_diagnostics() {
     local inc_timer="${APP_NAME}-${job_id}-incremental.timer"
     local full_service="${APP_NAME}-${job_id}-full.service"
     local inc_service="${APP_NAME}-${job_id}-incremental.service"
+    local recovery_service="${APP_NAME}-${job_id}-recovery.service"
+    local full_failure_service="${APP_NAME}-${job_id}-full-failure.service"
+    local inc_failure_service="${APP_NAME}-${job_id}-incremental-failure.service"
 
     echo "Timers systemd / systemd timers:"
     systemctl list-timers --all "$full_timer" "$inc_timer" --no-pager 2>/dev/null || true
     echo ""
 
     echo "Estado systemd / systemd status:"
-    systemctl status "$full_timer" "$inc_timer" "$full_service" "$inc_service" --no-pager 2>/dev/null || true
+    systemctl status "$full_timer" "$inc_timer" "$full_service" "$inc_service" "$recovery_service" "$full_failure_service" "$inc_failure_service" --no-pager 2>/dev/null || true
     echo ""
 
     if need_cmd journalctl; then
         echo "Ultimos eventos systemd / Recent systemd events:"
-        journalctl -u "$full_timer" -u "$inc_timer" -u "$full_service" -u "$inc_service" -n 40 --no-pager 2>/dev/null || true
+        journalctl -u "$full_timer" -u "$inc_timer" -u "$full_service" -u "$inc_service" -u "$recovery_service" -u "$full_failure_service" -u "$inc_failure_service" -n 40 --no-pager 2>/dev/null || true
         echo ""
     fi
 }
@@ -1730,35 +2309,154 @@ generate_ssh_key() {
     fi
 }
 
-test_email() {
+save_telegram_job_config() {
+    local job_file="$1"
+    local tmp_file
+    tmp_file="$(mktemp "${RUN_DIR}/job-conf.XXXXXX")"
+    chmod 600 "$tmp_file"
+    if [[ -f "$job_file" ]]; then
+        grep -Ev '^(TELEGRAM_ENABLED|TELEGRAM_BOT_TOKEN_FILE|TELEGRAM_CHAT_ID|TELEGRAM_MESSAGE_THREAD_ID|TELEGRAM_SILENT|TELEGRAM_INCLUDE_LOG|TELEGRAM_LOG_LINES|TELEGRAM_MAX_MESSAGE_CHARS|NOTIFY_START|NOTIFY_SUCCESS|NOTIFY_FAILURE)=' "$job_file" > "$tmp_file" || true
+    fi
+    write_var "$tmp_file" TELEGRAM_ENABLED "${TELEGRAM_ENABLED:-false}"
+    write_var "$tmp_file" TELEGRAM_BOT_TOKEN_FILE "${TELEGRAM_BOT_TOKEN_FILE:-${TELEGRAM_DEFAULT_TOKEN_FILE}}"
+    write_var "$tmp_file" TELEGRAM_CHAT_ID "${TELEGRAM_CHAT_ID:-}"
+    write_var "$tmp_file" TELEGRAM_MESSAGE_THREAD_ID "${TELEGRAM_MESSAGE_THREAD_ID:-}"
+    write_var "$tmp_file" TELEGRAM_SILENT "${TELEGRAM_SILENT:-false}"
+    write_var "$tmp_file" TELEGRAM_INCLUDE_LOG "${TELEGRAM_INCLUDE_LOG:-true}"
+    write_var "$tmp_file" TELEGRAM_LOG_LINES "${TELEGRAM_LOG_LINES:-${TELEGRAM_DEFAULT_LOG_LINES}}"
+    write_var "$tmp_file" TELEGRAM_MAX_MESSAGE_CHARS "${TELEGRAM_MAX_MESSAGE_CHARS:-${TELEGRAM_DEFAULT_MAX_MESSAGE_CHARS}}"
+    write_var "$tmp_file" NOTIFY_START "${NOTIFY_START:-true}"
+    write_var "$tmp_file" NOTIFY_SUCCESS "${NOTIFY_SUCCESS:-true}"
+    write_var "$tmp_file" NOTIFY_FAILURE "${NOTIFY_FAILURE:-true}"
+    install -m 600 "$tmp_file" "$job_file"
+    rm -f "$tmp_file"
+}
+
+configure_telegram() {
     require_root
     local job_id="${1:-}"
+    local token default_yes log_lines
     load_job "$job_id"
-    [[ -n "${EMAIL_TO:-}" ]] || die "EMAIL_TO no esta configurado para $JOB_ID"
-
     ensure_base_dirs
-    CURRENT_LOG="${LOG_DIR}/${JOB_ID}-test-email-$(date +%Y%m%d-%H%M%S).log"
-    : > "$CURRENT_LOG"
-    chmod 640 "$CURRENT_LOG"
-    {
-        echo "Prueba de notificacion de ${APP_NAME}"
-        echo "JOB_ID=$JOB_ID"
-        echo "FECHA=$(date -Is)"
-        echo "DESTINO=$EMAIL_TO"
-    } >> "$CURRENT_LOG"
 
-    if send_email "[${APP_NAME}] TEST: ${JOB_ID}" "$CURRENT_LOG"; then
-        ok "Correo de prueba aceptado por el sistema local para $EMAIL_TO"
-        warn "Si no llega al buzon, revise relay SMTP, spam y logs del MTA local. Log: $CURRENT_LOG"
+    echo ""
+    echo "Notificaciones Telegram / Telegram notifications"
+    if ! prompt_yes_no "Activar notificaciones Telegram? / Enable Telegram notifications? (s/n, y/n)" "$(bool_prompt_default "$TELEGRAM_ENABLED")"; then
+        TELEGRAM_ENABLED="false"
+        save_telegram_job_config "$JOB_FILE"
+        ok "Notificaciones Telegram desactivadas para $JOB_ID"
+        return 0
+    fi
+
+    TELEGRAM_ENABLED="true"
+    TELEGRAM_BOT_TOKEN_FILE="$(prompt "Archivo del token del bot / Bot token file" "${TELEGRAM_BOT_TOKEN_FILE:-${TELEGRAM_DEFAULT_TOKEN_FILE}}")"
+    mkdir -p "$(dirname "$TELEGRAM_BOT_TOKEN_FILE")"
+    chmod 700 "$(dirname "$TELEGRAM_BOT_TOKEN_FILE")" 2>/dev/null || true
+
+    default_yes="n"
+    [[ ! -s "$TELEGRAM_BOT_TOKEN_FILE" ]] && default_yes="s"
+    if prompt_yes_no "Guardar/actualizar token del bot en este servidor? / Save/update bot token on this server? (s/n, y/n)" "$default_yes"; then
+        token="$(prompt_secret_once "Token del bot Telegram / Telegram bot token")"
+        printf '%s' "$token" > "$TELEGRAM_BOT_TOKEN_FILE"
+        chmod 600 "$TELEGRAM_BOT_TOKEN_FILE"
+    fi
+    [[ -s "$TELEGRAM_BOT_TOKEN_FILE" ]] || die "No existe token Telegram en $TELEGRAM_BOT_TOKEN_FILE"
+
+    TELEGRAM_CHAT_ID="$(prompt "Chat ID o @canal/grupo / Chat ID or @channel/group" "${TELEGRAM_CHAT_ID:-}")"
+    [[ -n "$TELEGRAM_CHAT_ID" ]] || die "TELEGRAM_CHAT_ID no puede estar vacio"
+    TELEGRAM_MESSAGE_THREAD_ID="$(prompt "Message thread ID/topico, opcional / Topic thread ID, optional" "${TELEGRAM_MESSAGE_THREAD_ID:-}")"
+
+    if prompt_yes_no "Enviar sin sonido? / Send silently? (s/n, y/n)" "$(bool_prompt_default "$TELEGRAM_SILENT")"; then
+        TELEGRAM_SILENT="true"
     else
-        die "No se pudo enviar correo de prueba. Revise mail/mailx/sendmail y el MTA local."
+        TELEGRAM_SILENT="false"
+    fi
+    if prompt_yes_no "Incluir ultimas lineas del log? / Include recent log lines? (s/n, y/n)" "$(bool_prompt_default "$TELEGRAM_INCLUDE_LOG")"; then
+        TELEGRAM_INCLUDE_LOG="true"
+    else
+        TELEGRAM_INCLUDE_LOG="false"
+    fi
+    log_lines="$(prompt "Lineas de log en Telegram / Log lines in Telegram" "${TELEGRAM_LOG_LINES:-${TELEGRAM_DEFAULT_LOG_LINES}}")"
+    [[ "$log_lines" =~ ^[0-9]+$ ]] || die "TELEGRAM_LOG_LINES debe ser numerico"
+    TELEGRAM_LOG_LINES="$log_lines"
+    TELEGRAM_MAX_MESSAGE_CHARS="${TELEGRAM_MAX_MESSAGE_CHARS:-${TELEGRAM_DEFAULT_MAX_MESSAGE_CHARS}}"
+
+    prompt_yes_no "Notificar inicio de respaldo? / Notify backup start? (s/n, y/n)" "$(bool_prompt_default "$NOTIFY_START")" && NOTIFY_START="true" || NOTIFY_START="false"
+    prompt_yes_no "Notificar respaldos correctos? / Notify successful backups? (s/n, y/n)" "$(bool_prompt_default "$NOTIFY_SUCCESS")" && NOTIFY_SUCCESS="true" || NOTIFY_SUCCESS="false"
+    prompt_yes_no "Notificar fallos? / Notify failures? (s/n, y/n)" "$(bool_prompt_default "$NOTIFY_FAILURE")" && NOTIFY_FAILURE="true" || NOTIFY_FAILURE="false"
+
+    save_telegram_job_config "$JOB_FILE"
+    ok "Telegram configurado para $JOB_ID en chat ${TELEGRAM_CHAT_ID}"
+
+    if prompt_yes_no "Enviar prueba ahora? / Send test now? (s/n, y/n)" "s"; then
+        if ! test_telegram "$JOB_ID"; then
+            warn "La prueba Telegram fallo, pero la configuracion del job continua. Puede corregirla con: $APP_NAME telegram-config $JOB_ID"
+        fi
     fi
 }
 
-test_email_interactive() {
+test_telegram() {
+    require_root
+    local job_id="${1:-}"
+    load_job "$job_id"
+    [[ "${TELEGRAM_ENABLED:-false}" == "true" ]] || die "Telegram no esta habilitado para $JOB_ID"
+
+    ensure_base_dirs
+    CURRENT_LOG="${LOG_DIR}/${JOB_ID}-test-telegram-$(date +%Y%m%d-%H%M%S).log"
+    : > "$CURRENT_LOG"
+    chmod 640 "$CURRENT_LOG"
+    BACKUP_REQUESTED_TYPE="test"
+    BACKUP_EFFECTIVE_TYPE="test"
+    BACKUP_ID="test-$(date +%Y%m%d-%H%M%S)"
+    {
+        echo "Prueba de notificacion Telegram de ${APP_NAME}"
+        echo "JOB_ID=$JOB_ID"
+        echo "HOST=$(host_label)"
+        echo "FECHA=$(date -Is)"
+        echo "CHAT_ID=$TELEGRAM_CHAT_ID"
+    } >> "$CURRENT_LOG"
+
+    if notify_result "TEST" "$BACKUP_ID"; then
+        ok "Notificacion Telegram enviada a ${TELEGRAM_CHAT_ID}. Log: $CURRENT_LOG"
+    else
+        fail "No se pudo enviar notificacion Telegram. Revise token, chat_id, red y permisos del bot."
+        return 1
+    fi
+}
+
+telegram_updates() {
+    require_root
+    local job_id="${1:-}"
+    local token curl_config curl_rc=0
+    load_job "$job_id"
+    [[ -r "${TELEGRAM_BOT_TOKEN_FILE:-}" ]] || die "No se puede leer TELEGRAM_BOT_TOKEN_FILE para $JOB_ID"
+    need_cmd curl || die "curl no esta instalado"
+
+    token="$(read_secret_oneline "$TELEGRAM_BOT_TOKEN_FILE")"
+    [[ -n "$token" ]] || die "El token Telegram esta vacio"
+    ensure_base_dirs
+    curl_config="$(mktemp "${RUN_DIR}/telegram-updates.XXXXXX")"
+    chmod 600 "$curl_config"
+    printf 'url = "https://api.telegram.org/bot%s/getUpdates"\n' "$token" > "$curl_config"
+    if curl --silent --show-error --max-time 20 --config "$curl_config"; then
+        curl_rc=0
+    else
+        curl_rc=$?
+    fi
+    rm -f "$curl_config"
+    return "$curl_rc"
+}
+
+configure_telegram_interactive() {
     local job_id
     job_id="$(select_existing_job)"
-    test_email "$job_id"
+    configure_telegram "$job_id"
+}
+
+test_telegram_interactive() {
+    local job_id
+    job_id="$(select_existing_job)"
+    test_telegram "$job_id"
 }
 
 prompt() {
@@ -1935,7 +2633,13 @@ show_job_config() {
     echo "  Destino remoto / Remote destination: ${REMOTE_DEST:-none}"
     echo "  Puerto SSH / SSH port: $SSH_PORT"
     echo "  Llave SSH / SSH key: $SSH_KEY"
-    echo "  Email: ${EMAIL_TO:-none}"
+    echo "  Telegram / Telegram enabled: ${TELEGRAM_ENABLED:-false}"
+    echo "  Telegram chat ID: ${TELEGRAM_CHAT_ID:-none}"
+    echo "  Telegram token file: ${TELEGRAM_BOT_TOKEN_FILE:-none}"
+    echo "  Telegram topic/thread ID: ${TELEGRAM_MESSAGE_THREAD_ID:-none}"
+    echo "  Telegram include log: ${TELEGRAM_INCLUDE_LOG:-true}"
+    echo "  Telegram log lines: ${TELEGRAM_LOG_LINES:-${TELEGRAM_DEFAULT_LOG_LINES}}"
+    echo "  Notificar inicio / Notify start: ${NOTIFY_START:-true}"
     echo "  Notificar exito / Notify success: $NOTIFY_SUCCESS"
     echo "  Notificar fallos / Notify failures: $NOTIFY_FAILURE"
     echo "  Cifrado / Encryption: $ENCRYPTION_ENABLED"
@@ -2191,7 +2895,7 @@ configure_job() {
 
     echo -e "${C_BOLD}${C_BLUE}$(t title)${C_RESET}"
 
-    local name job_id backup_root retention full_cal inc_cal db_type db_mode remote_enabled remote_dest ssh_port email encryption_enabled encryption_pass_file encryption_pass
+    local name job_id backup_root retention full_cal inc_cal db_type db_mode remote_enabled remote_dest ssh_port encryption_enabled encryption_pass_file encryption_pass
     name="$(prompt "Nombre del job / Job name" "backup-principal")"
     job_id="$(safe_job_id "$name")"
     backup_root="$(prompt "Ruta local / Local backup path" "${DEFAULT_BACKUP_ROOT}/${job_id}")"
@@ -2267,7 +2971,6 @@ configure_job() {
         ssh_port="$(prompt "Puerto SSH / SSH port" "22")"
     fi
 
-    email="$(prompt "Email para notificaciones / Notification email (opcional/optional)")"
     encryption_enabled="false"
     encryption_pass_file="${SECRETS_DIR}/${job_id}.encpass"
     if prompt_yes_no "Cifrar respaldos con password? / Encrypt backups with password? (s/n, y/n)" "n"; then
@@ -2295,7 +2998,15 @@ configure_job() {
     write_var "$job_file" REMOTE_DEST "$remote_dest"
     write_var "$job_file" SSH_KEY "${KEY_DIR}/${job_id}_ed25519"
     write_var "$job_file" SSH_PORT "$ssh_port"
-    write_var "$job_file" EMAIL_TO "$email"
+    write_var "$job_file" TELEGRAM_ENABLED "false"
+    write_var "$job_file" TELEGRAM_BOT_TOKEN_FILE "$TELEGRAM_DEFAULT_TOKEN_FILE"
+    write_var "$job_file" TELEGRAM_CHAT_ID ""
+    write_var "$job_file" TELEGRAM_MESSAGE_THREAD_ID ""
+    write_var "$job_file" TELEGRAM_SILENT "false"
+    write_var "$job_file" TELEGRAM_INCLUDE_LOG "true"
+    write_var "$job_file" TELEGRAM_LOG_LINES "$TELEGRAM_DEFAULT_LOG_LINES"
+    write_var "$job_file" TELEGRAM_MAX_MESSAGE_CHARS "$TELEGRAM_DEFAULT_MAX_MESSAGE_CHARS"
+    write_var "$job_file" NOTIFY_START "true"
     write_var "$job_file" NOTIFY_SUCCESS "true"
     write_var "$job_file" NOTIFY_FAILURE "true"
     write_var "$job_file" ENCRYPTION_ENABLED "$encryption_enabled"
@@ -2308,6 +3019,7 @@ configure_job() {
     chmod 750 "$backup_root"
 
     ok "Job creado / Job created: $job_id"
+    configure_telegram "$job_id"
 
     if [[ "$remote_enabled" == "true" ]]; then
         generate_ssh_key "$job_id"
@@ -2356,8 +3068,10 @@ menu() {
         echo "10) $(t ssh_key)"
         echo "11) $(t ssh_install)"
         echo "12) $(t delete_job)"
-        echo "13) $(t test_email)"
-        echo "14) $(t language)"
+        echo "13) $(t telegram_config)"
+        echo "14) $(t test_telegram)"
+        echo "15) $(t uninstall)"
+        echo "16) $(t language)"
         echo "0) $(t exit)"
         opt="$(read_input "$(t option): ")"
         case "$opt" in
@@ -2373,8 +3087,10 @@ menu() {
             10) generate_ssh_key "$(prompt "$(t job_id)")" ;;
             11) install_remote_key "$(prompt "$(t job_id)")" ;;
             12) delete_menu ;;
-            13) test_email_interactive ;;
-            14) choose_language ;;
+            13) configure_telegram_interactive ;;
+            14) test_telegram_interactive ;;
+            15) uninstall_manager ;;
+            16) choose_language ;;
             0) exit 0 ;;
             *) warn "$(t invalid)" ;;
         esac
@@ -2405,7 +3121,12 @@ main() {
         remote-key) shift; generate_ssh_key "$@" ;;
         remote-install-key) shift; install_remote_key "$@" ;;
         remote-test) shift; remote_test "$@" ;;
-        test-email) shift; test_email "$@" ;;
+        telegram-config) shift; configure_telegram "$@" ;;
+        test-telegram) shift; test_telegram "$@" ;;
+        telegram-updates) shift; telegram_updates "$@" ;;
+        recover) shift; recover_job "$@" ;;
+        systemd-failure) shift; systemd_failure_notify "$@" ;;
+        uninstall) shift; uninstall_manager "$@" ;;
         delete) shift; [[ $# -gt 0 ]] && delete_job "$@" || delete_menu ;;
         menu|"") menu ;;
         help|-h|--help) usage ;;
